@@ -7,18 +7,19 @@ through specifications before capabilities are implemented.
 ## Current status
 
 - Executable project using Rust 2024 and Cargo.
-- `sf run <message>` sends a request to OpenCode using GPT-6 Luna with the
-  `xhigh` variant (requires an OpenCode CLI that supports `--variant`).
+- `sf serve` starts the local project-builder HTTP API on `127.0.0.1:3000` by
+  default. It stores data in `$HOME/sf` and launches OpenCode planning and
+  implementation agents when requested.
 - The [`sf` terminal command](docs/specs/terminal-command.md) and
-  [agent runner](docs/specs/agent-run.md) specifications are implemented. See
-  [`docs/specs/`](docs/specs/) for the workflow and template.
+  [project builder API](docs/specs/project-builder-api.md) capabilities are
+  implemented. See [`docs/specs/`](docs/specs/) for the workflow and template.
 
 ## Development
 
 Requires Rust and Cargo.
 
 ```sh
-cargo run
+cargo run -- serve
 cargo fmt --check
 cargo test
 cargo clippy --all-targets --all-features -- -D warnings
@@ -40,8 +41,20 @@ the command from any directory:
 
 ```sh
 command -v sf
-sf
+sf serve
 ```
+
+The API defaults to `http://127.0.0.1:3000`; override its bind address with
+`sf serve --host <host> --port <port>`. Browser requests are allowed from HTTP
+localhost and loopback origins. The API contract currently includes:
+
+- `POST /api/sessions`, `GET /api/sessions`, and `GET /api/sessions/{id}`
+- `POST /api/sessions/{id}/messages`
+- `PUT`/`DELETE /api/sessions/{id}/requirements/{requirement_id}/pin`
+- `DELETE /api/sessions/{id}/requirements/{requirement_id}`
+- `POST /api/sessions/{id}/deleted-requirements/{requirement_id}/restore`
+- `POST /api/sessions/{id}/projects`, `GET /api/projects`, and
+  `GET /api/projects/{id}`
 
 ## Specification-driven development (SDD)
 

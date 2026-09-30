@@ -1,9 +1,15 @@
 # Run an AI agent
 
-- **Status:** Implemented
+- **Status:** Rejected
 - **Last updated:** 2026-09-30
 
-## Context and problem
+## Rejection note
+
+The standalone `sf run <message>` capability is superseded by the project
+builder API, which invokes OpenCode through role-specific adapters and exposes
+agent features through `sf serve`.
+
+## Context and problem (historical)
 
 The `sf` command needs to pass user requests to a coding agent. OpenCode is the
 first supported agent, while the design must allow other agent integrations to
@@ -63,18 +69,10 @@ process invocation in its own adapter. Avoid a CLI dependency unless needed.
 
 ## Open questions
 
-- [ ] What minimum OpenCode CLI version should be documented? The installed
-  version here is 1.18.33 and its `opencode run --help` does not list
-  `--variant`, which this feature requires for `xhigh`.
+- Not applicable; this standalone CLI capability has been superseded.
 
 ## Verification
 
-Verified CLI dispatch and OpenCode command construction with `cargo test` (5
-tests). `cargo fmt --check` and
-`cargo clippy --all-targets --all-features -- -D warnings` passed. Installed
-with `cargo install --path . --force`; from `/tmp`, `sf --help` succeeded,
-`sf unknown` exited with status 2, and `sf run "verification prompt"` with
-OpenCode removed from `PATH` reported the start failure and exited with status
-1. A live model request was not sent. The installed OpenCode CLI does not list
-`--variant` in its help, so execution against that installed version remains
-unverified.
+The retired CLI behavior was verified before replacement. Current agent adapter
+verification is documented in
+[the project builder API specification](project-builder-api.md).

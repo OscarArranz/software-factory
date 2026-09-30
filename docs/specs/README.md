@@ -1,7 +1,7 @@
 # Specifications
 
-This directory contains the specifications that guide development. The
-implemented requirement is to make the executable available as `sf`.
+This directory contains the specifications that guide development. Current
+capabilities include the `sf` executable and the project builder API.
 
 ## Workflow
 
@@ -26,4 +26,5 @@ and ask for clarification before treating them as requirements.
 ## Specifications
 
 - [Short terminal command (`sf`)](terminal-command.md) — Implemented
-- [Run an AI agent](agent-run.md) — Implemented
+- [Project builder API](project-builder-api.md) — Implemented
+- [Run an AI agent](agent-run.md) — Rejected (superseded by the project builder API)
