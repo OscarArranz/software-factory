@@ -1,16 +1,17 @@
 # Software Factory
 
-This repository is the starting point for developing a software factory. The
-product has no defined requirements yet: its specific purpose, users,
-capabilities, scope, and constraints will be agreed through specifications
-before features are implemented.
+This repository is the starting point for developing a software factory. Its
+broader purpose, users, scope, and constraints will be defined incrementally
+through specifications before capabilities are implemented.
 
 ## Current status
 
 - Executable project using Rust 2024 and Cargo.
-- The application does not implement product behavior yet.
-- The [`sf` terminal command specification](docs/specs/terminal-command.md) is
-  implemented. See [`docs/specs/`](docs/specs/) for the workflow and template.
+- `sf run <message>` sends a request to OpenCode using GPT-6 Luna with the
+  `xhigh` variant (requires an OpenCode CLI that supports `--variant`).
+- The [`sf` terminal command](docs/specs/terminal-command.md) and
+  [agent runner](docs/specs/agent-run.md) specifications are implemented. See
+  [`docs/specs/`](docs/specs/) for the workflow and template.
 
 ## Development
 

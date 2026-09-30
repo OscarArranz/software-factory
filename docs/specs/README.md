@@ -26,3 +26,4 @@ and ask for clarification before treating them as requirements.
 ## Specifications
 
 - [Short terminal command (`sf`)](terminal-command.md) — Implemented
+- [Run an AI agent](agent-run.md) — Implemented
