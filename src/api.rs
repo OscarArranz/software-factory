@@ -11,13 +11,16 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tokio::net::TcpListener;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::{
     agents::{AgentError, BuilderAgent, opencode::OpenCodeAgent},
-    domain::{Project, SessionState, implementation_prompt, planner_prompt},
+    domain::{
+        CreateProjectRequest, ErrorResponse, Project, SendMessageRequest, SessionState,
+        implementation_prompt, planner_prompt,
+    },
     store::{Store, StoreError},
 };
 
@@ -34,7 +37,8 @@ impl AppState {
         let data_directory = home.join("sf");
         let projects_directory = data_directory.join("projects");
         std::fs::create_dir_all(&projects_directory).map_err(ApiError::internal)?;
-        let store = Store::open(&data_directory.join("software-factory.sqlite3"))?;
+        let mut store = Store::open(&data_directory.join("software-factory.sqlite3"))?;
+        reconcile_project_records(&mut store)?;
         Ok(Self {
             store: Arc::new(Mutex::new(store)),
             agent,
@@ -108,10 +112,17 @@ fn is_local_web_origin(origin: &HeaderValue) -> bool {
     let Some(host) = uri.host() else {
         return false;
     };
-    host == "localhost"
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|address| address.is_loopback())
+    let host = host.trim_end_matches('.');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    let address = host
+        .strip_prefix('[')
+        .and_then(|host| host.strip_suffix(']'))
+        .unwrap_or(host);
+    address
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|address| address.is_loopback())
 }
 
 #[derive(Serialize)]
@@ -136,12 +147,6 @@ async fn get_session(
     Path(session_id): Path<String>,
 ) -> Result<Json<SessionState>, ApiError> {
     Ok(Json(state.store()?.get_session(&session_id)?))
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SendMessageRequest {
-    content: String,
 }
 
 async fn send_message(
@@ -220,12 +225,6 @@ async fn restore_requirement(
     ))
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CreateProjectRequest {
-    name: String,
-}
-
 async fn create_project(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
@@ -257,6 +256,8 @@ async fn create_project(
 
     let background_state = state.clone();
     let background_project = project.clone();
+    let failure_state = state.clone();
+    let failed_project_id = project.id.clone();
     tokio::spawn(async move {
         let result = tokio::task::spawn_blocking(move || {
             execute_project(background_state, background_project)
@@ -264,6 +265,7 @@ async fn create_project(
         .await;
         if let Err(error) = result {
             eprintln!("sf: project worker failed: {error}");
+            mark_project_failed(&failure_state, &failed_project_id, &error.to_string());
         }
     });
 
@@ -301,6 +303,7 @@ fn execute_project(state: AppState, project: Project) {
             "sf: could not mark project {} as running: {error}",
             project.id
         );
+        mark_project_failed(&state, &project.id, &error.to_string());
         return;
     }
 
@@ -316,6 +319,25 @@ fn execute_project(state: AppState, project: Project) {
     let result = agent.implement(&directory, &prompt);
     match result {
         Ok(()) => {
+            match project_contains_files(&directory) {
+                Ok(true) => {}
+                Ok(false) => {
+                    mark_project_failed(
+                        &state,
+                        &project.id,
+                        "implementation agent exited successfully without creating project files",
+                    );
+                    return;
+                }
+                Err(error) => {
+                    mark_project_failed(
+                        &state,
+                        &project.id,
+                        &format!("could not verify generated project files: {error}"),
+                    );
+                    return;
+                }
+            }
             if let Err(error) = state.store().and_then(|mut store| {
                 store
                     .update_project_status(&project.id, "completed", None)
@@ -330,6 +352,39 @@ fn execute_project(state: AppState, project: Project) {
         }
         Err(error) => mark_project_failed(&state, &project.id, &error.to_string()),
     }
+}
+
+fn project_contains_files(directory: &FsPath) -> std::io::Result<bool> {
+    for entry in std::fs::read_dir(directory)? {
+        let entry = entry?;
+        if entry.file_name() == ".git" {
+            continue;
+        }
+        let file_type = entry.file_type()?;
+        if file_type.is_file() {
+            return Ok(true);
+        }
+        if file_type.is_dir() && project_contains_files(&entry.path())? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn reconcile_project_records(store: &mut Store) -> Result<(), StoreError> {
+    store.fail_interrupted_projects()?;
+    for project in store.list_projects()? {
+        if project.status != "completed" {
+            continue;
+        }
+        let error = match project_contains_files(FsPath::new(&project.path)) {
+            Ok(true) => continue,
+            Ok(false) => "previous implementation completed without creating project files".into(),
+            Err(error) => format!("could not verify previously completed project files: {error}"),
+        };
+        store.update_project_status(&project.id, "failed", Some(&error))?;
+    }
+    Ok(())
 }
 
 fn mark_project_failed(state: &AppState, project_id: &str, message: &str) {
@@ -352,11 +407,6 @@ async fn get_project(
     Path(project_id): Path<String>,
 ) -> Result<Json<Project>, ApiError> {
     Ok(Json(state.store()?.get_project(&project_id)?))
-}
-
-#[derive(Serialize)]
-struct ErrorResponse {
-    error: String,
 }
 
 #[derive(Debug)]
@@ -448,16 +498,17 @@ mod tests {
 
     use crate::{
         agents::{AgentError, BuilderAgent},
-        domain::{Architecture, PlannerResponse, RequirementChange, SessionState},
+        domain::{Architecture, PlannerResponse, Project, RequirementChange, SessionState},
         store::Store,
     };
 
-    use super::{AppState, router};
+    use super::{AppState, reconcile_project_records, router};
 
     #[derive(Clone)]
     struct FakeAgent {
         response: Arc<Mutex<Option<PlannerResponse>>>,
         implementation_calls: Arc<Mutex<Vec<(PathBuf, String)>>>,
+        create_project_files: bool,
     }
 
     impl BuilderAgent for FakeAgent {
@@ -479,6 +530,10 @@ mod tests {
                 .lock()
                 .expect("fake implementation lock should work")
                 .push((_working_directory.to_path_buf(), _prompt.to_owned()));
+            if self.create_project_files {
+                std::fs::write(_working_directory.join("README.md"), "# Generated project")
+                    .expect("fake agent should write a generated project file");
+            }
             Ok(())
         }
     }
@@ -487,6 +542,7 @@ mod tests {
         FakeAgent {
             response: Arc::new(Mutex::new(Some(response))),
             implementation_calls: Arc::new(Mutex::new(Vec::new())),
+            create_project_files: true,
         }
     }
 
@@ -691,6 +747,110 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, PathBuf::from(&current.path));
         assert!(calls[0].1.contains("Persist project data"));
+    }
+
+    #[tokio::test]
+    async fn successful_agent_exit_without_files_marks_project_failed() {
+        let home = tempfile::tempdir().expect("temp dir should be created");
+        let mut fake = fake_agent(project_plan_response());
+        fake.create_project_files = false;
+        let app = router(state_with_agent(fake, home.path()));
+        let session = create_planned_session(&app).await;
+        let response = request(
+            app.clone(),
+            "POST",
+            &format!("/api/sessions/{}/projects", session.id),
+            Some(json!({ "name": "empty-project" })),
+        )
+        .await;
+        let queued: Project = serde_json::from_value(json_body(response).await)
+            .expect("project response should deserialize");
+
+        let mut current = queued.clone();
+        for _ in 0..100 {
+            let response = request(
+                app.clone(),
+                "GET",
+                &format!("/api/projects/{}", queued.id),
+                None,
+            )
+            .await;
+            current = serde_json::from_value(json_body(response).await)
+                .expect("project poll response should deserialize");
+            if current.status == "failed" || current.status == "completed" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(current.status, "failed");
+        assert_eq!(
+            current.error.as_deref(),
+            Some("implementation agent exited successfully without creating project files")
+        );
+        assert!(
+            std::fs::read_dir(current.path)
+                .expect("failed project directory should remain inspectable")
+                .next()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn startup_marks_previously_completed_empty_projects_failed() {
+        let home = tempfile::tempdir().expect("temp dir should be created");
+        let database = home.path().join("builder.sqlite3");
+        let mut store = Store::open(&database).expect("database should open");
+        let session = store.create_session().expect("session should be created");
+        let session = store
+            .apply_planner_response(&session.id, session.revision, &project_plan_response())
+            .expect("plan should be stored");
+
+        let empty_directory = home.path().join("empty-project");
+        std::fs::create_dir(&empty_directory).expect("empty project path should be created");
+        let empty_project = store
+            .create_project_record(
+                &session.id,
+                "empty-project",
+                &empty_directory.to_string_lossy(),
+            )
+            .expect("empty project should be recorded");
+        store
+            .update_project_status(&empty_project.id, "completed", None)
+            .expect("empty project should be marked completed for this regression test");
+
+        let populated_directory = home.path().join("populated-project");
+        std::fs::create_dir(&populated_directory)
+            .expect("populated project path should be created");
+        std::fs::write(populated_directory.join("main.rs"), "fn main() {}")
+            .expect("project file should be written");
+        let populated_project = store
+            .create_project_record(
+                &session.id,
+                "populated-project",
+                &populated_directory.to_string_lossy(),
+            )
+            .expect("populated project should be recorded");
+        store
+            .update_project_status(&populated_project.id, "completed", None)
+            .expect("populated project should be marked completed");
+
+        reconcile_project_records(&mut store).expect("startup recovery should succeed");
+
+        assert_eq!(
+            store
+                .get_project(&empty_project.id)
+                .expect("empty project should remain available")
+                .status,
+            "failed"
+        );
+        assert_eq!(
+            store
+                .get_project(&populated_project.id)
+                .expect("populated project should remain available")
+                .status,
+            "completed"
+        );
     }
 
     #[tokio::test]
@@ -901,8 +1061,9 @@ mod tests {
         let local = Request::builder()
             .method("OPTIONS")
             .uri("/api/sessions")
-            .header("origin", "http://localhost:5173")
-            .header("access-control-request-method", "POST")
+            .header("origin", "http://localhost.:5173")
+            .header("access-control-request-method", "PUT")
+            .header("access-control-request-headers", "content-type")
             .body(Body::empty())
             .expect("preflight request should build");
         let response = app
@@ -913,7 +1074,39 @@ mod tests {
         assert_eq!(
             response.headers().get("access-control-allow-origin"),
             Some(&axum::http::HeaderValue::from_static(
-                "http://localhost:5173"
+                "http://localhost.:5173"
+            ))
+        );
+        assert!(
+            response
+                .headers()
+                .get("access-control-allow-headers")
+                .is_some_and(|value| value.to_str().unwrap_or_default().contains("content-type"))
+        );
+        assert!(
+            response
+                .headers()
+                .get("access-control-allow-methods")
+                .is_some_and(|value| value.to_str().unwrap_or_default().contains("PUT"))
+        );
+
+        let loopback_ip = Request::builder()
+            .method("OPTIONS")
+            .uri("/api/sessions")
+            .header("origin", "http://127.0.0.1:8080")
+            .header("access-control-request-method", "POST")
+            .header("access-control-request-headers", "content-type")
+            .body(Body::empty())
+            .expect("loopback IP preflight should build");
+        let response = app
+            .clone()
+            .oneshot(loopback_ip)
+            .await
+            .expect("loopback preflight should run");
+        assert_eq!(
+            response.headers().get("access-control-allow-origin"),
+            Some(&axum::http::HeaderValue::from_static(
+                "http://127.0.0.1:8080"
             ))
         );
 

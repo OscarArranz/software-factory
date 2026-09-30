@@ -434,6 +434,19 @@ impl Store {
         self.get_project(project_id)
     }
 
+    pub fn fail_interrupted_projects(&mut self) -> Result<usize, StoreError> {
+        self.connection
+            .execute(
+                "UPDATE projects
+                 SET status = 'failed',
+                     error = 'Builder service restarted before implementation completed',
+                     updated_at = ?1
+                 WHERE status IN ('queued', 'running')",
+                [now()],
+            )
+            .map_err(StoreError::Database)
+    }
+
     pub fn get_project(&self, id: &str) -> Result<Project, StoreError> {
         self.connection
             .query_row(
@@ -905,5 +918,43 @@ mod tests {
             "Original architecture"
         );
         assert_eq!(current.requirements[0].text, "Keep the data local");
+    }
+
+    #[test]
+    fn interrupted_project_jobs_are_failed_when_the_service_restarts() {
+        let mut store = Store::in_memory();
+        let session = store.create_session().expect("session should be created");
+        let response = PlannerResponse {
+            schema_version: 1,
+            message: "A plan was agreed".to_owned(),
+            architecture: Some(Architecture {
+                overview: "A small service".to_owned(),
+                stack: vec![],
+                decisions: vec![],
+            }),
+            requirement_changes: vec![RequirementChange::Add {
+                text: "Write a project file".to_owned(),
+            }],
+            questions: vec![],
+        };
+        let session = store
+            .apply_planner_response(&session.id, session.revision, &response)
+            .expect("plan should be stored");
+        let project = store
+            .create_project_record(&session.id, "interrupted", "/tmp/interrupted")
+            .expect("project should be recorded");
+        store
+            .update_project_status(&project.id, "running", None)
+            .expect("project should start running");
+
+        assert_eq!(store.fail_interrupted_projects().unwrap(), 1);
+        let recovered = store
+            .get_project(&project.id)
+            .expect("project should remain available");
+        assert_eq!(recovered.status, "failed");
+        assert_eq!(
+            recovered.error.as_deref(),
+            Some("Builder service restarted before implementation completed")
+        );
     }
 }

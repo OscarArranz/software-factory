@@ -10,9 +10,12 @@ through specifications before capabilities are implemented.
 - `sf serve` starts the local project-builder HTTP API on `127.0.0.1:3000` by
   default. It stores data in `$HOME/sf` and launches OpenCode planning and
   implementation agents when requested.
-- The [`sf` terminal command](docs/specs/terminal-command.md) and
-  [project builder API](docs/specs/project-builder-api.md) capabilities are
-  implemented. See [`docs/specs/`](docs/specs/) for the workflow and template.
+- The multi-crate Cargo workspace includes a Leptos CSR web client at
+  `crates/web-ui` and shared API types in `crates/api-types`.
+- The [`sf` terminal command](docs/specs/terminal-command.md),
+  [project builder API](docs/specs/project-builder-api.md), and
+  [web UI](docs/specs/builder-web-ui.md) are implemented. See
+  [`docs/specs/`](docs/specs/) for the workflow and template.
 
 ## Development
 
@@ -21,9 +24,32 @@ Requires Rust and Cargo.
 ```sh
 cargo run -- serve
 cargo fmt --check
-cargo test
-cargo clippy --all-targets --all-features -- -D warnings
+cargo test --workspace
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
+
+### Run the web UI
+
+Install the WebAssembly target and Trunk once:
+
+```sh
+rustup target add wasm32-unknown-unknown
+cargo install --locked trunk
+```
+
+Run `sf serve` in one terminal and the web client in another:
+
+```sh
+cd crates/web-ui
+trunk serve
+```
+
+Open `http://127.0.0.1:8080`. The client uses
+`http://127.0.0.1:3000` for the API by default. Set `SF_API_BASE_URL` when
+building with Trunk to target another API origin.
+
+To create an optimized static bundle, run `trunk build --release` from
+`crates/web-ui`; the generated `dist/` directory is ignored by Git.
 
 ### Build and install for terminal testing
 
@@ -55,6 +81,13 @@ localhost and loopback origins. The API contract currently includes:
 - `POST /api/sessions/{id}/deleted-requirements/{requirement_id}/restore`
 - `POST /api/sessions/{id}/projects`, `GET /api/projects`, and
   `GET /api/projects/{id}`
+
+OpenCode agent runs are limited to 600 seconds by default. Set
+`SF_AGENT_TIMEOUT_SECS` before starting `sf serve` to configure a different
+timeout. Timed-out builds and builds that produce no files are reported as
+failed rather than remaining in the running state. Jobs left queued or running
+when the service stops, and older completed records without files, are marked
+failed on the next startup.
 
 ## Specification-driven development (SDD)
 

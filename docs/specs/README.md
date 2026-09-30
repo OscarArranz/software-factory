@@ -27,4 +27,5 @@ and ask for clarification before treating them as requirements.
 
 - [Short terminal command (`sf`)](terminal-command.md) — Implemented
 - [Project builder API](project-builder-api.md) — Implemented
+- [Project builder web UI](builder-web-ui.md) — Implemented
 - [Run an AI agent](agent-run.md) — Rejected (superseded by the project builder API)

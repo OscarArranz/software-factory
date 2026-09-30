@@ -92,6 +92,14 @@ outcome are available through the API.
   must not be overwritten.
 - **R7:** Browser CORS must permit HTTP localhost/loopback origins and reject
   non-loopback origins by default.
+- **R8:** OpenCode agent processes must have a finite configurable timeout. A
+  timeout must set the project to `failed` with a useful error instead of
+  leaving it `running` indefinitely.
+- **R9:** A project must not be marked `completed` unless the implementation
+  agent created at least one project file outside `.git`.
+- **R10:** When the service starts, project jobs left `queued` or `running` by
+  an earlier service process and previously completed projects with no generated
+  files must be marked `failed` with an explanatory error.
 
 ## Acceptance criteria
 
@@ -119,6 +127,13 @@ outcome are available through the API.
 - **AC9:** Given a browser preflight from a loopback origin, when it requests an
   API method, then the API returns the appropriate CORS headers; a non-loopback
   origin receives no allow-origin header.
+- **AC10:** Given an implementation agent that times out or exits successfully
+  without creating files, when project execution ends, then the project is
+  marked `failed` with an explanatory error.
+- **AC11:** Given a project job was `queued` or `running` before the service
+  stopped, or a completed project has no generated files, when the service
+  starts again, then that record is marked `failed`; completed projects with
+  files remain completed.
 
 ## Technical considerations
 
@@ -138,7 +153,7 @@ agent with the new project directory as its working directory.
 
 ## Verification
 
-Verified with `cargo fmt --check`, `cargo test` (31 tests), and
+Verified with `cargo fmt --check`, `cargo test` (36 tests), and
 `cargo clippy --all-targets --all-features -- -D warnings`. Installed with
 `cargo install --path . --force`. A smoke test started `sf serve` with a
 temporary home directory, fetched `/api/health`, and created a persisted
@@ -146,4 +161,5 @@ session. Verified `sf --help` and confirmed the removed `sf run` command exits
 unsuccessfully. API tests cover session persistence, agent response validation,
 pin/unpin and tombstone behavior, project creation/status, destination conflicts,
 and loopback-only browser CORS. OpenCode CLI arguments and JSON-event parsing
-were tested with fixtures; no live model request was sent.
+were tested with fixtures. A live OpenCode smoke run created a file in a
+temporary project directory under `$HOME/sf/projects`.

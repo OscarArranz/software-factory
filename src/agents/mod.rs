@@ -1,4 +1,4 @@
-use std::{error::Error, fmt, io, path::Path};
+use std::{error::Error, fmt, io, path::Path, time::Duration};
 
 pub mod opencode;
 
@@ -13,14 +13,23 @@ pub trait BuilderAgent: Send + Sync {
 #[derive(Debug)]
 pub enum AgentError {
     FailedToStart(io::Error),
+    FailedToWait(io::Error),
+    FailedToReadOutput(io::Error),
     UnsuccessfulExit { code: Option<i32>, stderr: String },
     InvalidOutput(String),
+    TimedOut { timeout: Duration },
 }
 
 impl fmt::Display for AgentError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::FailedToStart(error) => write!(formatter, "failed to start agent: {error}"),
+            Self::FailedToWait(error) => {
+                write!(formatter, "failed while waiting for agent: {error}")
+            }
+            Self::FailedToReadOutput(error) => {
+                write!(formatter, "failed to read agent output: {error}")
+            }
             Self::UnsuccessfulExit {
                 code: Some(code),
                 stderr,
@@ -29,6 +38,13 @@ impl fmt::Display for AgentError {
                 write_exit_error(formatter, -1, stderr)
             }
             Self::InvalidOutput(message) => write!(formatter, "invalid agent output: {message}"),
+            Self::TimedOut { timeout } => {
+                write!(
+                    formatter,
+                    "agent timed out after {} seconds",
+                    timeout.as_secs()
+                )
+            }
         }
     }
 }
@@ -50,8 +66,10 @@ fn write_exit_error(formatter: &mut fmt::Formatter<'_>, code: i32, stderr: &str)
 impl Error for AgentError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::FailedToStart(error) => Some(error),
-            Self::UnsuccessfulExit { .. } | Self::InvalidOutput(_) => None,
+            Self::FailedToStart(error)
+            | Self::FailedToWait(error)
+            | Self::FailedToReadOutput(error) => Some(error),
+            Self::UnsuccessfulExit { .. } | Self::InvalidOutput(_) | Self::TimedOut { .. } => None,
         }
     }
 }

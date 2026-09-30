@@ -2,80 +2,16 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
+pub use software_factory_api_types::{
+    Architecture, CreateProjectRequest, DeletedRequirement, ErrorResponse, Message, MessageRole,
+    Project, ProjectSnapshot, Requirement, SendMessageRequest, SessionState,
+};
+
 pub const PLANNER_SCHEMA_VERSION: u32 = 1;
 const MAX_ASSISTANT_MESSAGE: usize = 20_000;
 const MAX_REQUIREMENT_LENGTH: usize = 3_000;
 const MAX_ARCHITECTURE_TEXT: usize = 8_000;
 const MAX_PLANNER_CHANGES: usize = 50;
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct Architecture {
-    pub overview: String,
-    pub stack: Vec<StackChoice>,
-    pub decisions: Vec<ArchitectureDecision>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct StackChoice {
-    pub category: String,
-    pub technology: String,
-    pub rationale: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ArchitectureDecision {
-    pub topic: String,
-    pub decision: String,
-    pub rationale: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct Requirement {
-    pub id: String,
-    pub text: String,
-    pub pinned: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct DeletedRequirement {
-    pub id: String,
-    pub text: String,
-    pub deleted_at: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum MessageRole {
-    User,
-    Assistant,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct Message {
-    pub id: String,
-    pub role: MessageRole,
-    pub content: String,
-    pub created_at: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct SessionState {
-    pub id: String,
-    pub revision: i64,
-    pub architecture: Option<Architecture>,
-    pub messages: Vec<Message>,
-    pub requirements: Vec<Requirement>,
-    pub deleted_requirements: Vec<DeletedRequirement>,
-    pub created_at: i64,
-    pub updated_at: i64,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -92,27 +28,6 @@ pub struct PlannerResponse {
 pub enum RequirementChange {
     Add { text: String },
     Update { id: String, text: String },
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ProjectSnapshot {
-    pub architecture: Architecture,
-    pub requirements: Vec<Requirement>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct Project {
-    pub id: String,
-    pub session_id: String,
-    pub name: String,
-    pub path: String,
-    pub status: String,
-    pub error: Option<String>,
-    pub snapshot: ProjectSnapshot,
-    pub created_at: i64,
-    pub updated_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,7 +165,11 @@ pub fn implementation_prompt(snapshot: &ProjectSnapshot) -> Result<String, serde
     Ok(format!(
         "Initialize this software project in the current empty directory. Follow the agreed \
          architecture, stack, and requirements below. Implement the project, add appropriate \
-         tests and documentation, and run relevant checks. Do not alter the agreed scope.\n\n\
+         tests and documentation, and run relevant checks. Do not alter the agreed scope. \
+         This is a non-interactive run: do not ask questions, request approval, or wait for \
+         terminal input. Create the actual project files; do not only describe what should be \
+         created. If the plan is underspecified, make the narrowest reasonable choice and mention \
+         it in your final summary.\n\n\
          Agreed project plan:\n{plan}"
     ))
 }

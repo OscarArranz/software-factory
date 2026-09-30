@@ -1,7 +1,10 @@
 use std::{
     collections::HashMap,
+    io::{self, Read},
     path::Path,
-    process::{Command, Output},
+    process::{Child, Command, Output, Stdio},
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use crate::domain::PlannerResponse;
@@ -10,6 +13,8 @@ use super::{AgentError, BuilderAgent};
 
 const MODEL: &str = "openai/gpt-6-luna";
 const VARIANT: &str = "xhigh";
+const DEFAULT_AGENT_TIMEOUT: Duration = Duration::from_secs(600);
+const AGENT_TIMEOUT_ENV: &str = "SF_AGENT_TIMEOUT_SECS";
 
 #[derive(Debug, Default)]
 pub struct OpenCodeAgent;
@@ -41,9 +46,10 @@ impl OpenCodeAgent {
         agent: &str,
         prompt: &str,
     ) -> Result<Output, AgentError> {
-        self.command(working_directory, agent, prompt)
-            .output()
-            .map_err(AgentError::FailedToStart)
+        run_command(
+            self.command(working_directory, agent, prompt),
+            configured_agent_timeout(),
+        )
     }
 
     fn check_status(output: &Output) -> Result<(), AgentError> {
@@ -55,6 +61,78 @@ impl OpenCodeAgent {
         }
         Ok(())
     }
+}
+
+fn configured_agent_timeout() -> Duration {
+    std::env::var(AGENT_TIMEOUT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_AGENT_TIMEOUT)
+}
+
+fn run_command(mut command: Command, timeout: Duration) -> Result<Output, AgentError> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(AgentError::FailedToStart)?;
+    let stdout = child.stdout.take().expect("piped stdout is available");
+    let stderr = child.stderr.take().expect("piped stderr is available");
+    let stdout_reader = read_output_in_background(stdout);
+    let stderr_reader = read_output_in_background(stderr);
+    let started = Instant::now();
+
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < timeout => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => {
+                terminate_child(&mut child);
+                let _ = join_output(stdout_reader);
+                let _ = join_output(stderr_reader);
+                return Err(AgentError::TimedOut { timeout });
+            }
+            Err(error) => {
+                terminate_child(&mut child);
+                let _ = join_output(stdout_reader);
+                let _ = join_output(stderr_reader);
+                return Err(AgentError::FailedToWait(error));
+            }
+        }
+    };
+
+    Ok(Output {
+        status,
+        stdout: join_output(stdout_reader)?,
+        stderr: join_output(stderr_reader)?,
+    })
+}
+
+fn read_output_in_background<R>(mut reader: R) -> JoinHandle<io::Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output)?;
+        Ok(output)
+    })
+}
+
+fn join_output(reader: JoinHandle<io::Result<Vec<u8>>>) -> Result<Vec<u8>, AgentError> {
+    reader
+        .join()
+        .map_err(|_| AgentError::FailedToReadOutput(io::Error::other("output reader panicked")))?
+        .map_err(AgentError::FailedToReadOutput)
+}
+
+fn terminate_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 impl BuilderAgent for OpenCodeAgent {
@@ -121,9 +199,13 @@ fn extract_text_events(output: &str) -> Result<String, AgentError> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{
+        path::Path,
+        process::Command,
+        time::{Duration, Instant},
+    };
 
-    use super::{OpenCodeAgent, extract_text_events};
+    use super::{AgentError, OpenCodeAgent, extract_text_events, run_command};
 
     #[test]
     fn extracts_assistant_text_from_raw_json_events() {
@@ -181,5 +263,31 @@ mod tests {
                 "Return JSON"
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminates_an_agent_process_after_its_timeout() {
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        let started = Instant::now();
+
+        let result = run_command(command, Duration::from_millis(100));
+
+        assert!(matches!(result, Err(AgentError::TimedOut { .. })));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn captures_output_from_a_completed_process() {
+        let mut command = Command::new("printf");
+        command.arg("agent output");
+
+        let output =
+            run_command(command, Duration::from_secs(2)).expect("short process should complete");
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"agent output");
     }
 }
