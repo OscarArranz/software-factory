@@ -8,6 +8,16 @@ pub trait BuilderAgent: Send + Sync {
     fn plan(&self, working_directory: &Path, prompt: &str) -> Result<PlannerResponse, AgentError>;
 
     fn implement(&self, working_directory: &Path, prompt: &str) -> Result<(), AgentError>;
+
+    fn orchestrate(
+        &self,
+        _working_directory: &Path,
+        _prompt: &str,
+    ) -> Result<crate::orchestration::OrchestratorResponse, AgentError> {
+        Err(AgentError::InvalidOutput(
+            "orchestration is not supported by this adapter".into(),
+        ))
+    }
 }
 
 #[derive(Debug)]

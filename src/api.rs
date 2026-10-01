@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     path::{Path as FsPath, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
 };
@@ -19,7 +20,7 @@ use crate::{
     agents::{AgentError, BuilderAgent, opencode::OpenCodeAgent},
     domain::{
         CreateProjectRequest, ErrorResponse, Project, SendMessageRequest, SessionState,
-        implementation_prompt, planner_prompt,
+        planner_prompt,
     },
     store::{Store, StoreError},
 };
@@ -27,30 +28,42 @@ use crate::{
 #[derive(Clone)]
 pub struct AppState {
     store: Arc<Mutex<Store>>,
-    agent: Arc<dyn BuilderAgent>,
+    pub(crate) agent: Arc<dyn BuilderAgent>,
     data_directory: PathBuf,
     projects_directory: PathBuf,
+    integration_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 impl AppState {
-    fn from_home(home: &FsPath, agent: Arc<dyn BuilderAgent>) -> Result<Self, ApiError> {
+    pub(crate) fn from_home(home: &FsPath, agent: Arc<dyn BuilderAgent>) -> Result<Self, ApiError> {
         let data_directory = home.join("sf");
         let projects_directory = data_directory.join("projects");
         std::fs::create_dir_all(&projects_directory).map_err(ApiError::internal)?;
         let mut store = Store::open(&data_directory.join("software-factory.sqlite3"))?;
+        crate::orchestration::reconcile(&mut store)?;
         reconcile_project_records(&mut store)?;
         Ok(Self {
             store: Arc::new(Mutex::new(store)),
             agent,
             data_directory,
             projects_directory,
+            integration_locks: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
-    fn store(&self) -> Result<MutexGuard<'_, Store>, ApiError> {
+    pub(crate) fn store(&self) -> Result<MutexGuard<'_, Store>, ApiError> {
         self.store
             .lock()
             .map_err(|_| ApiError::internal("database lock is poisoned"))
+    }
+
+    pub(crate) fn integration_lock(&self, project_id: &str) -> Result<Arc<Mutex<()>>, String> {
+        let mut locks = self.integration_locks.lock().map_err(|e| e.to_string())?;
+        Ok(Arc::clone(
+            locks
+                .entry(project_id.into())
+                .or_insert_with(|| Arc::new(Mutex::new(()))),
+        ))
     }
 }
 
@@ -59,6 +72,7 @@ pub async fn serve(host: &str, port: u16) -> Result<(), Box<dyn std::error::Erro
         .map(PathBuf::from)
         .ok_or("HOME is not set")?;
     let state = AppState::from_home(&home, Arc::new(OpenCodeAgent))?;
+    crate::orchestration::start_scheduler(state.clone());
     let app = router(state);
     let listener = TcpListener::bind((host, port)).await?;
     let address = listener.local_addr()?;
@@ -88,6 +102,11 @@ fn router(state: AppState) -> Router {
         .route("/api/sessions/{session_id}/projects", post(create_project))
         .route("/api/projects", get(list_projects))
         .route("/api/projects/{project_id}", get(get_project))
+        .route("/api/projects/{project_id}/workspace", get(get_workspace))
+        .route(
+            "/api/projects/{project_id}/messages",
+            post(send_project_message),
+        )
         .layer(
             CorsLayer::new()
                 .allow_origin(AllowOrigin::predicate(|origin: &HeaderValue, _| {
@@ -307,16 +326,53 @@ fn execute_project(state: AppState, project: Project) {
         return;
     }
 
-    let prompt = match implementation_prompt(&project.snapshot) {
-        Ok(prompt) => prompt,
-        Err(error) => {
-            mark_project_failed(&state, &project.id, &error.to_string());
-            return;
-        }
+    let task = software_factory_api_types::ProjectTask {
+        id: crate::domain::new_id(),
+        plan_id: crate::domain::new_id(),
+        spec: software_factory_api_types::TaskSpec {
+            title: "Initialize project".into(),
+            description: crate::domain::implementation_prompt(&project.snapshot)
+                .unwrap_or_else(|_| "Initialize the agreed project".into()),
+            acceptance_criteria: project
+                .snapshot
+                .requirements
+                .iter()
+                .flat_map(|r| r.acceptance_criteria.clone())
+                .collect(),
+            verification_commands: vec![
+                "test -n \"$(git ls-files; git ls-files --others --exclude-standard)\"".into(),
+            ],
+            dependencies: vec![],
+        },
+        status: software_factory_api_types::TaskStatus::Implementing,
+        branch: None,
+        worktree: None,
+        base_commit: None,
+        commit: None,
+        error: None,
+        activity: vec!["Initial project creation explicitly requested".into()],
     };
-    let agent = Arc::clone(&state.agent);
+    let initialized = state.store().and_then(|mut store| {
+        let mut workspace = store.workspace(&project.id)?;
+        let revision = workspace.revision;
+        workspace
+            .plans
+            .push(software_factory_api_types::ProjectPlan {
+                id: task.plan_id.clone(),
+                summary: "Initial project creation".into(),
+                approved: true,
+                superseded: false,
+            });
+        workspace.tasks.push(task.clone());
+        store.save_workspace(&mut workspace, revision)?;
+        Ok(())
+    });
+    if let Err(error) = initialized {
+        mark_project_failed(&state, &project.id, &error.to_string());
+        return;
+    }
     let directory = PathBuf::from(&project.path);
-    let result = agent.implement(&directory, &prompt);
+    let result = crate::orchestration::execute(&state, &project, &task);
     match result {
         Ok(()) => {
             match project_contains_files(&directory) {
@@ -350,11 +406,18 @@ fn execute_project(state: AppState, project: Project) {
                 );
             }
         }
-        Err(error) => mark_project_failed(&state, &project.id, &error.to_string()),
+        Err(error) => {
+            let _ = crate::orchestration::mutate_task(&state, &project.id, &task.id, |task| {
+                task.status = software_factory_api_types::TaskStatus::Failed;
+                task.error = Some(error.clone());
+                task.activity.push(error.clone());
+            });
+            mark_project_failed(&state, &project.id, &error);
+        }
     }
 }
 
-fn project_contains_files(directory: &FsPath) -> std::io::Result<bool> {
+pub(crate) fn project_contains_files(directory: &FsPath) -> std::io::Result<bool> {
     for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
         if entry.file_name() == ".git" {
@@ -409,8 +472,76 @@ async fn get_project(
     Ok(Json(state.store()?.get_project(&project_id)?))
 }
 
+async fn get_workspace(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+) -> Result<Json<software_factory_api_types::ProjectWorkspace>, ApiError> {
+    Ok(Json(state.store()?.workspace(&project_id)?))
+}
+
+async fn send_project_message(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+    Json(request): Json<SendMessageRequest>,
+) -> Result<Json<software_factory_api_types::ProjectWorkspace>, ApiError> {
+    use software_factory_api_types::MessageRole;
+    let content = request.content.trim();
+    if content.is_empty() || content.chars().count() > 20_000 {
+        return Err(ApiError::invalid("message must contain 1-20000 characters"));
+    }
+    let project = state.store()?.get_project(&project_id)?;
+    if project.status != "completed" {
+        return Err(ApiError::conflict(
+            "project creation must complete before orchestration",
+        ));
+    }
+    let mut workspace = {
+        let mut store = state.store()?;
+        let mut workspace = store.workspace(&project_id)?;
+        let revision = workspace.revision;
+        if let Some(plan_id) = content.strip_prefix("confirm ") {
+            workspace.messages.push(crate::orchestration::message(
+                MessageRole::User,
+                content.into(),
+            ));
+            crate::orchestration::approve(&mut workspace, plan_id.trim())?;
+            store.save_workspace(&mut workspace, revision)?;
+            return Ok(Json(workspace));
+        }
+        workspace.messages.push(crate::orchestration::message(
+            MessageRole::User,
+            content.into(),
+        ));
+        store.save_workspace(&mut workspace, revision)?;
+        workspace
+    };
+    // Prepare Git before read-only orchestration, serialized with integration.
+    let preparing_state = state.clone();
+    let preparing_project = project.clone();
+    tokio::task::spawn_blocking(move || {
+        let lock = preparing_state.integration_lock(&preparing_project.id)?;
+        let _guard = lock.lock().map_err(|e| e.to_string())?;
+        crate::project_git::prepare(FsPath::new(&preparing_project.path))
+    })
+    .await
+    .map_err(ApiError::internal)?
+    .map_err(ApiError::conflict)?;
+    let prompt = crate::orchestration::prompt(&project, &workspace).map_err(ApiError::internal)?;
+    let agent = Arc::clone(&state.agent);
+    let response =
+        tokio::task::spawn_blocking(move || agent.orchestrate(FsPath::new(&project.path), &prompt))
+            .await
+            .map_err(ApiError::internal)?
+            .map_err(ApiError::agent)?;
+    let revision = workspace.revision;
+    crate::orchestration::apply_response(&mut workspace, response)
+        .map_err(|error| ApiError::agent(AgentError::InvalidOutput(error.to_string())))?;
+    state.store()?.save_workspace(&mut workspace, revision)?;
+    Ok(Json(workspace))
+}
+
 #[derive(Debug)]
-struct ApiError {
+pub(crate) struct ApiError {
     status: StatusCode,
     message: String,
 }
@@ -512,6 +643,26 @@ mod tests {
     }
 
     impl BuilderAgent for FakeAgent {
+        fn orchestrate(
+            &self,
+            _: &Path,
+            _: &str,
+        ) -> Result<crate::orchestration::OrchestratorResponse, AgentError> {
+            Ok(crate::orchestration::OrchestratorResponse {
+                schema_version: 1,
+                message: "Review this change plan".into(),
+                plan: Some(crate::orchestration::PlanProposal {
+                    summary: "Add a feature".into(),
+                    tasks: vec![software_factory_api_types::TaskSpec {
+                        title: "Feature".into(),
+                        description: "Implement feature".into(),
+                        acceptance_criteria: vec!["Feature works".into()],
+                        verification_commands: vec!["test -f feature".into()],
+                        dependencies: vec![],
+                    }],
+                }),
+            })
+        }
         fn plan(
             &self,
             _working_directory: &Path,
@@ -558,6 +709,7 @@ mod tests {
             agent: Arc::new(agent),
             data_directory,
             projects_directory,
+            integration_locks: Arc::new(Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -590,10 +742,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn project_chat_requires_confirmation_and_workspace_is_read_only() {
+        use software_factory_api_types::{ProjectWorkspace, TaskStatus};
+        let home = tempfile::tempdir().unwrap();
+        let state = state_with_agent(fake_agent(project_plan_response()), home.path());
+        let app = router(state.clone());
+        let session = create_planned_session(&app).await;
+        let directory = home.path().join("sf/projects/legacy");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("README.md"), "legacy project").unwrap();
+        let project = {
+            let mut store = state.store().unwrap();
+            let project = store
+                .create_project_record(&session.id, "legacy", &directory.to_string_lossy())
+                .unwrap();
+            store
+                .update_project_status(&project.id, "completed", None)
+                .unwrap()
+        };
+        let url = format!("/api/projects/{}/messages", project.id);
+        let response = request(
+            app.clone(),
+            "POST",
+            &url,
+            Some(json!({"content":"Add feature"})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let workspace: ProjectWorkspace =
+            serde_json::from_value(json_body(response).await).unwrap();
+        assert_eq!(workspace.messages.len(), 2);
+        assert_eq!(workspace.tasks[0].status, TaskStatus::PendingApproval);
+        assert!(directory.join(".git").exists());
+        assert_eq!(
+            std::fs::read_to_string(directory.join("README.md")).unwrap(),
+            "legacy project"
+        );
+        let bad = request(
+            app.clone(),
+            "POST",
+            &url,
+            Some(json!({"content":"confirm wrong"})),
+        )
+        .await;
+        assert_eq!(bad.status(), StatusCode::NOT_FOUND);
+        let confirmed = request(
+            app.clone(),
+            "POST",
+            &url,
+            Some(json!({"content":format!("confirm {}", workspace.plans[0].id)})),
+        )
+        .await;
+        assert_eq!(confirmed.status(), StatusCode::OK);
+        let workspace: ProjectWorkspace =
+            serde_json::from_value(json_body(confirmed).await).unwrap();
+        assert_eq!(workspace.tasks[0].status, TaskStatus::Queued);
+        assert_eq!(workspace.messages[2].role, crate::domain::MessageRole::User);
+        let read_url = format!("/api/projects/{}/workspace", project.id);
+        let forbidden = request(app.clone(), "PUT", &read_url, Some(json!({"tasks":[]}))).await;
+        assert_eq!(forbidden.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let fetched = request(app, "GET", &read_url, None).await;
+        assert_eq!(json_body(fetched).await["tasks"][0]["status"], "queued");
+    }
+
+    #[tokio::test]
     async fn creates_sessions_and_persists_agent_turns() {
         let home = tempfile::tempdir().expect("temp dir should be created");
         let agent = fake_agent(PlannerResponse {
-            schema_version: 1,
+            schema_version: 2,
             message: "Let's use a local database.".to_owned(),
             architecture: Some(Architecture {
                 overview: "A local project".to_owned(),
@@ -602,6 +818,8 @@ mod tests {
             }),
             requirement_changes: vec![RequirementChange::Add {
                 text: "Persist user data".to_owned(),
+                kind: crate::domain::RequirementKind::Functional,
+                acceptance_criteria: vec!["Data survives restart".into()],
             }],
             questions: vec![],
         });
@@ -647,7 +865,7 @@ mod tests {
         let home = tempfile::tempdir().expect("temp dir should be created");
         let app = router(state_with_agent(
             fake_agent(PlannerResponse {
-                schema_version: 1,
+                schema_version: 2,
                 message: "Ready".to_owned(),
                 architecture: None,
                 requirement_changes: vec![],
@@ -688,7 +906,7 @@ mod tests {
 
     fn project_plan_response() -> PlannerResponse {
         PlannerResponse {
-            schema_version: 1,
+            schema_version: 2,
             message: "Architecture and requirement captured".to_owned(),
             architecture: Some(Architecture {
                 overview: "A small local service".to_owned(),
@@ -697,6 +915,8 @@ mod tests {
             }),
             requirement_changes: vec![RequirementChange::Add {
                 text: "Persist project data".to_owned(),
+                kind: crate::domain::RequirementKind::Functional,
+                acceptance_criteria: vec!["Data survives restart".into()],
             }],
             questions: vec![],
         }
@@ -745,7 +965,20 @@ mod tests {
         );
         let calls = calls.lock().expect("fake implementation lock should work");
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].0, PathBuf::from(&current.path));
+        assert!(
+            calls[0].0.starts_with(
+                Path::new(&current.path)
+                    .parent()
+                    .unwrap()
+                    .join(".sf-worktrees")
+            )
+        );
+        assert!(!calls[0].0.exists(), "merged worktree should be removed");
+        assert_eq!(
+            crate::project_git::git(Path::new(&current.path), &["branch", "--show-current"])
+                .unwrap(),
+            "main"
+        );
         assert!(calls[0].1.contains("Persist project data"));
     }
 
@@ -788,12 +1021,7 @@ mod tests {
             current.error.as_deref(),
             Some("implementation agent exited successfully without creating project files")
         );
-        assert!(
-            std::fs::read_dir(current.path)
-                .expect("failed project directory should remain inspectable")
-                .next()
-                .is_none()
-        );
+        assert!(!super::project_contains_files(Path::new(&current.path)).unwrap());
     }
 
     #[test]
@@ -904,12 +1132,14 @@ mod tests {
         *response_slot
             .lock()
             .expect("fake response lock should work") = Some(PlannerResponse {
-            schema_version: 1,
+            schema_version: 2,
             message: "I changed it".to_owned(),
             architecture: None,
             requirement_changes: vec![RequirementChange::Update {
                 id: requirement.id.clone(),
                 text: "Change the project data".to_owned(),
+                kind: crate::domain::RequirementKind::Functional,
+                acceptance_criteria: vec!["Data survives restart".into()],
             }],
             questions: vec![],
         });
@@ -949,12 +1179,14 @@ mod tests {
         *response_slot
             .lock()
             .expect("fake response lock should work") = Some(PlannerResponse {
-            schema_version: 1,
+            schema_version: 2,
             message: "The unlocked requirement was updated".to_owned(),
             architecture: None,
             requirement_changes: vec![RequirementChange::Update {
                 id: requirement.id,
                 text: "Change the project data after review".to_owned(),
+                kind: crate::domain::RequirementKind::Functional,
+                acceptance_criteria: vec!["Data survives restart".into()],
             }],
             questions: vec![],
         });

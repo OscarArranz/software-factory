@@ -30,6 +30,11 @@ clients should be able to use the same application capabilities.
 
 ## Expected behavior
 
+The [project orchestration specification](project-orchestration.md) extends this
+baseline with typed requirements, persisted questions, project conversations,
+approved task plans and isolated local Git execution. Its newer behavior takes
+precedence over the original direct-directory implementation flow below.
+
 `sf serve` starts an HTTP API, listening on `127.0.0.1` by default. Host and
 port can be configured when starting the server. The previous `sf run` command
 is removed. Browser CORS requests are allowed only from HTTP localhost and

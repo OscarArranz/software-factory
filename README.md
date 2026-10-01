@@ -12,9 +12,12 @@ through specifications before capabilities are implemented.
   implementation agents when requested.
 - The multi-crate Cargo workspace includes a Leptos CSR web client at
   `crates/web-ui` and shared API types in `crates/api-types`.
+- The architect collects functional/non-functional requirements and acceptance
+  criteria. Created projects have an orchestrator chat and a read-only kanban.
 - The [`sf` terminal command](docs/specs/terminal-command.md),
   [project builder API](docs/specs/project-builder-api.md), and
-  [web UI](docs/specs/builder-web-ui.md) are implemented. See
+  [web UI](docs/specs/builder-web-ui.md), and
+  [project orchestration](docs/specs/project-orchestration.md) are implemented. See
   [`docs/specs/`](docs/specs/) for the workflow and template.
 
 ## Development
@@ -81,13 +84,38 @@ localhost and loopback origins. The API contract currently includes:
 - `POST /api/sessions/{id}/deleted-requirements/{requirement_id}/restore`
 - `POST /api/sessions/{id}/projects`, `GET /api/projects`, and
   `GET /api/projects/{id}`
+- `GET /api/projects/{id}/workspace` (conversation, plans and tasks)
+- `POST /api/projects/{id}/messages` (orchestration and plan confirmation)
+
+### Project changes and local Git execution
+
+Open a completed project from **Projects**, describe a change to the orchestrator,
+and review its proposed tasks and verification commands. Use **Confirm plan in
+chat**, or send `confirm <plan-id>`, to authorize that exact plan version.
+Task content and status are agent-managed; the kanban has no editing controls.
+
+Independent tasks run in parallel (two per project by default). Configure the
+limit from 1 to 16 with `SF_IMPLEMENTER_CONCURRENCY`. Dependencies wait until
+their predecessors have merged. Every implementer starts in an isolated branch
+and worktree from current `main`; the executor verifies changes, commits them,
+serializes integration, incorporates newer main changes, verifies again and
+merges locally. Successfully merged worktrees are removed. Failed or conflicting
+work is retained for investigation and follow-up through an approved plan.
+No remote Git operations are used. Git must be installed.
+
+Existing requirements remain unclassified until refined by the architect; pinned
+ones must be unpinned before refinement. Existing projects without Git are
+initialized on the first orchestrator request. Existing dirty repositories must
+be committed or stashed before execution. Existing branches/files are preserved.
 
 OpenCode agent runs are limited to 600 seconds by default. Set
 `SF_AGENT_TIMEOUT_SECS` before starting `sf serve` to configure a different
 timeout. Timed-out builds and builds that produce no files are reported as
-failed rather than remaining in the running state. Jobs left queued or running
-when the service stops, and older completed records without files, are marked
-failed on the next startup.
+failed rather than remaining in the running state. Interrupted task execution is
+reconciled with Git on startup: merged commits are recognized and worktrees
+cleaned, while unresolved work is blocked and retained. Interrupted initial
+creation that has not merged, and older completed records without files, is
+marked failed. Approved tasks still queued resume after startup.
 
 ## Specification-driven development (SDD)
 
