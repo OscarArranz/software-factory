@@ -1,6 +1,8 @@
 mod agents;
 mod api;
 mod domain;
+mod orchestration;
+mod project_git;
 mod store;
 
 use std::process::ExitCode;

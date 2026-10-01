@@ -72,7 +72,12 @@ fn configured_agent_timeout() -> Duration {
         .unwrap_or(DEFAULT_AGENT_TIMEOUT)
 }
 
-fn run_command(mut command: Command, timeout: Duration) -> Result<Output, AgentError> {
+pub(crate) fn run_command(mut command: Command, timeout: Duration) -> Result<Output, AgentError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -105,6 +110,7 @@ fn run_command(mut command: Command, timeout: Duration) -> Result<Output, AgentE
         }
     };
 
+    terminate_process_group(&child);
     Ok(Output {
         status,
         stdout: join_output(stdout_reader)?,
@@ -130,12 +136,38 @@ fn join_output(reader: JoinHandle<io::Result<Vec<u8>>>) -> Result<Vec<u8>, Agent
         .map_err(AgentError::FailedToReadOutput)
 }
 
+fn terminate_process_group(child: &Child) {
+    #[cfg(unix)]
+    {
+        // Kill descendants too: inherited output pipes otherwise keep readers
+        // blocked after a verification shell or agent itself has timed out.
+        let _ = Command::new("kill")
+            .args(["-KILL", "--", &format!("-{}", child.id())])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(not(unix))]
+    let _ = child;
+}
+
 fn terminate_child(child: &mut Child) {
+    terminate_process_group(child);
     let _ = child.kill();
     let _ = child.wait();
 }
 
 impl BuilderAgent for OpenCodeAgent {
+    fn orchestrate(
+        &self,
+        working_directory: &Path,
+        prompt: &str,
+    ) -> Result<crate::orchestration::OrchestratorResponse, AgentError> {
+        let output = self.invoke(working_directory, "plan", prompt)?;
+        Self::check_status(&output)?;
+        let text = extract_text_events(&String::from_utf8_lossy(&output.stdout))?;
+        serde_json::from_str(&text).map_err(|error| AgentError::InvalidOutput(error.to_string()))
+    }
     fn plan(&self, working_directory: &Path, prompt: &str) -> Result<PlannerResponse, AgentError> {
         let output = self.invoke(working_directory, "plan", prompt)?;
         Self::check_status(&output)?;
@@ -206,6 +238,30 @@ mod tests {
     };
 
     use super::{AgentError, OpenCodeAgent, extract_text_events, run_command};
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_terminates_shell_descendants_holding_output_pipes() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 20 & wait"]);
+        let started = Instant::now();
+        assert!(matches!(
+            run_command(command, Duration::from_millis(100)),
+            Err(AgentError::TimedOut { .. })
+        ));
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_shell_does_not_leave_background_processes_holding_pipes() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 20 &"]);
+        let started = Instant::now();
+        let output = run_command(command, Duration::from_secs(1)).unwrap();
+        assert!(output.status.success());
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
 
     #[test]
     fn extracts_assistant_text_from_raw_json_events() {

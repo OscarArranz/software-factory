@@ -4,10 +4,10 @@ use uuid::Uuid;
 
 pub use software_factory_api_types::{
     Architecture, CreateProjectRequest, DeletedRequirement, ErrorResponse, Message, MessageRole,
-    Project, ProjectSnapshot, Requirement, SendMessageRequest, SessionState,
+    Project, ProjectSnapshot, Requirement, RequirementKind, SendMessageRequest, SessionState,
 };
 
-pub const PLANNER_SCHEMA_VERSION: u32 = 1;
+pub const PLANNER_SCHEMA_VERSION: u32 = 2;
 const MAX_ASSISTANT_MESSAGE: usize = 20_000;
 const MAX_REQUIREMENT_LENGTH: usize = 3_000;
 const MAX_ARCHITECTURE_TEXT: usize = 8_000;
@@ -26,8 +26,17 @@ pub struct PlannerResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum RequirementChange {
-    Add { text: String },
-    Update { id: String, text: String },
+    Add {
+        text: String,
+        kind: RequirementKind,
+        acceptance_criteria: Vec<String>,
+    },
+    Update {
+        id: String,
+        text: String,
+        kind: RequirementKind,
+        acceptance_criteria: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,14 +96,33 @@ impl PlannerResponse {
             .map(|requirement| normalize_requirement(&requirement.text))
             .collect::<Vec<_>>();
         for change in &self.requirement_changes {
+            let (kind, criteria) = match change {
+                RequirementChange::Add {
+                    kind,
+                    acceptance_criteria,
+                    ..
+                }
+                | RequirementChange::Update {
+                    kind,
+                    acceptance_criteria,
+                    ..
+                } => (kind, acceptance_criteria),
+            };
+            if *kind == RequirementKind::Unclassified || criteria.is_empty() || criteria.len() > 20
+            {
+                return Err(ValidationError::Invalid("requirements need a functional/non-functional category and 1-20 acceptance criteria".into()));
+            }
+            for criterion in criteria {
+                validate_text(criterion, 2_000, "acceptance criterion")?;
+            }
             match change {
-                RequirementChange::Add { text } => {
+                RequirementChange::Add { text, .. } => {
                     validate_text(text, MAX_REQUIREMENT_LENGTH, "requirement")?;
                     let normalized = normalize_requirement(text);
                     ensure_text_is_new(&normalized, &active_texts, &deleted_texts, None)?;
                     active_texts.insert(format!("\0new-{}", active_texts.len()), normalized);
                 }
-                RequirementChange::Update { id, text } => {
+                RequirementChange::Update { id, text, .. } => {
                     validate_text(text, MAX_REQUIREMENT_LENGTH, "requirement")?;
                     if updated_ids.iter().any(|updated_id| updated_id == id) {
                         return Err(ValidationError::Invalid(format!(
@@ -143,13 +171,21 @@ pub fn new_id() -> String {
 pub fn planner_prompt(state: &SessionState) -> Result<String, serde_json::Error> {
     let context = serde_json::to_string(state)?;
     Ok(format!(
-        "You are the software project's planning agent. Do not create or edit files.\n\
+        "You are an experienced software architect eliciting requirements. Do not create or edit files.\n\
+         First understand business goals, stakeholders, users, workflows, scope boundaries and constraints. \
+         Separate functional behavior from non-functional quality attributes and constraints. \
+         Ask focused questions about relevant performance, reliability, security, accessibility, \
+         deployment and maintainability needs; do not invent targets or impose irrelevant checklists. \
+         Each requirement must have verifiable acceptance criteria. For non-functional requirements \
+         seek measurable agreed targets. Explain architecture tradeoffs and trace decisions to needs. \
+         The questions array is the complete list of still-open questions, not just this turn's questions.\n\
          Respond with exactly one JSON object and no Markdown. The object must have fields: \
-         schema_version (integer 1), message (string), architecture (object or null), \
+         schema_version (integer 2), message (string), architecture (object or null), \
          requirement_changes (array), and questions (array of strings). Architecture objects \
          have overview (string), stack (array of {{category, technology, rationale}}), and \
          decisions (array of {{topic, decision, rationale}}). Requirement changes are only \
-         {{operation: \"add\", text: string}} or {{operation: \"update\", id: string, text: string}}.\n\
+         {{operation: \"add\", text: string, kind: \"functional\" or \"non_functional\", acceptance_criteria: [string]}} \
+         or {{operation: \"update\", id: string, text: string, kind: \"functional\" or \"non_functional\", acceptance_criteria: [string]}}.\n\
          The server assigns IDs. Never change or suggest an operation for a pinned requirement. \
          You cannot pin, unpin, delete, or restore requirements. Deleted requirements are listed \
          separately: do not recreate their intent, including by paraphrase. If the user asks to \
@@ -259,16 +295,19 @@ mod tests {
                 id: "locked".to_owned(),
                 text: "Use Rust".to_owned(),
                 pinned: true,
+                kind: super::RequirementKind::NonFunctional,
+                acceptance_criteria: vec!["Rust builds".into()],
             }],
             deleted_requirements: vec![],
             created_at: 1,
             updated_at: 1,
+            questions: vec![],
         }
     }
 
     fn response(changes: Vec<RequirementChange>) -> PlannerResponse {
         PlannerResponse {
-            schema_version: 1,
+            schema_version: 2,
             message: "Got it".to_owned(),
             architecture: None,
             requirement_changes: changes,
@@ -282,6 +321,8 @@ mod tests {
             response(vec![RequirementChange::Update {
                 id: "locked".to_owned(),
                 text: "Use another language".to_owned(),
+                kind: super::RequirementKind::NonFunctional,
+                acceptance_criteria: vec!["Builds".into()],
             }])
             .validate(&state()),
             Err(ValidationError::Conflict(_))
@@ -293,6 +334,8 @@ mod tests {
         assert!(
             response(vec![RequirementChange::Add {
                 text: " use   RUST ".to_owned(),
+                kind: super::RequirementKind::NonFunctional,
+                acceptance_criteria: vec!["Builds".into()],
             }])
             .validate(&state())
             .is_err()
@@ -305,9 +348,13 @@ mod tests {
             response(vec![
                 RequirementChange::Add {
                     text: "Store project data".to_owned(),
+                    kind: super::RequirementKind::Functional,
+                    acceptance_criteria: vec!["Data persists".into()],
                 },
                 RequirementChange::Add {
                     text: " store   PROJECT data ".to_owned(),
+                    kind: super::RequirementKind::Functional,
+                    acceptance_criteria: vec!["Data persists".into()],
                 },
             ])
             .validate(&state())

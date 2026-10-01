@@ -25,6 +25,10 @@ requirements, and launch and monitor project creation.
 
 ## Expected behavior
 
+The [project orchestration specification](project-orchestration.md) extends this
+baseline with categorized requirements, acceptance criteria, open questions,
+project detail/chat, plan confirmation and a read-only task kanban.
+
 The web application is built and served separately with Trunk. In development,
 it connects to `http://127.0.0.1:3000` by default while `sf serve` runs in a
 separate process. The API base URL can be configured at build time.

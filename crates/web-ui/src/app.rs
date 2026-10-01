@@ -2,13 +2,14 @@ use gloo_net::http::{Request, Response};
 use leptos::{ev::SubmitEvent, prelude::*};
 use serde::{Serialize, de::DeserializeOwned};
 use software_factory_api_types::{
-    Architecture, CreateProjectRequest, ErrorResponse, Message, MessageRole, Project, Requirement,
-    SendMessageRequest, SessionState,
+    Architecture, CreateProjectRequest, ErrorResponse, Message, MessageRole, Project, ProjectTask,
+    ProjectWorkspace, Requirement, RequirementKind, SendMessageRequest, SessionState, TaskStatus,
 };
 use wasm_bindgen_futures::spawn_local as spawn_browser_task;
 
 use crate::interaction::{
-    append_optimistic_user_message, requirement_view_key, should_submit_message,
+    append_optimistic_user_message, display_project_message, requirement_view_key,
+    should_submit_message,
 };
 
 const DEFAULT_API_BASE: &str = "http://127.0.0.1:3000";
@@ -41,6 +42,7 @@ pub fn App() -> impl IntoView {
     let active_session = RwSignal::new(None::<SessionState>);
     let projects = RwSignal::new(Vec::<Project>::new());
     let screen = RwSignal::new(Screen::Builder);
+    let selected_project = RwSignal::new(None::<Project>);
     let composer = RwSignal::new(String::new());
     let message_pending = RwSignal::new(false);
     let mutation_pending = RwSignal::new(false);
@@ -51,10 +53,6 @@ pub fn App() -> impl IntoView {
     let api_base = StoredValue::new(api_base_url());
 
     let send_message = Callback::new({
-        let sessions = sessions;
-        let active_session = active_session;
-        let message_pending = message_pending;
-        let error = error;
         let api_base = api_base.get_value();
         move |content: String| {
             if message_pending.get_untracked() || content.trim().is_empty() {
@@ -71,10 +69,7 @@ pub fn App() -> impl IntoView {
                 let result = async {
                     let session = match active_session.get_untracked() {
                         Some(session) => session,
-                        None => {
-                            let session = ApiClient::create_session(&api_base).await?;
-                            session
-                        }
+                        None => ApiClient::create_session(&api_base).await?,
                     };
                     let optimistic = append_optimistic_user_message(&session, &content);
                     replace_session(sessions, active_session, optimistic);
@@ -99,10 +94,6 @@ pub fn App() -> impl IntoView {
     });
 
     let requirement_action = Callback::new({
-        let sessions = sessions;
-        let active_session = active_session;
-        let mutation_pending = mutation_pending;
-        let error = error;
         let api_base = api_base.get_value();
         move |(requirement_id, action): (String, RequirementAction)| {
             mutate_requirement(
@@ -118,10 +109,6 @@ pub fn App() -> impl IntoView {
     });
 
     Effect::new({
-        let sessions = sessions;
-        let active_session = active_session;
-        let projects = projects;
-        let error = error;
         let api_base = api_base.get_value();
         move |_| {
             let api_base = api_base.clone();
@@ -171,7 +158,7 @@ pub fn App() -> impl IntoView {
                     >"Builder"</button>
                     <button
                         class:nav-active=move || screen.get() == Screen::Projects
-                        on:click=move |_| screen.set(Screen::Projects)
+                        on:click=move |_| { selected_project.set(None); screen.set(Screen::Projects); }
                     >"Projects"</button>
                 </nav>
                 <div class="topbar-actions">
@@ -240,12 +227,17 @@ pub fn App() -> impl IntoView {
                     }
                 }
             >
-                <ProjectLibrary
-                    projects=projects
-                    project_pending=project_pending
-                    api_base=api_base.get_value()
-                    error=error
-                />
+                <Show when=move || selected_project.get().is_some() fallback=move || view! {
+                    <ProjectLibrary
+                        projects=projects project_pending=project_pending api_base=api_base.get_value() error=error
+                        open_project=Callback::new(move |project| selected_project.set(Some(project)))
+                    />
+                }>
+                    {move || selected_project.get().map(|project| view! {
+                        <ProjectWorkspaceView project=project api_base=api_base.get_value()
+                            go_back=Callback::new(move |()| selected_project.set(None)) />
+                    })}
+                </Show>
             </Show>
 
             <Show when=move || create_project_open.get()>
@@ -517,25 +509,15 @@ fn PlanningPanel(
                     when=move || active_session.with(|active| active.as_ref().is_some_and(|session| !session.requirements.is_empty()))
                     fallback=move || view! { <div class="plan-empty">"Agreed requirements will be collected here."</div> }
                 >
-                    <div class="requirement-list">
-                        <For
-                            each=move || active_session.get().map(|session| session.requirements).unwrap_or_default()
-                            key=requirement_view_key
-                            children=move |requirement| {
-                                let requirement_id = requirement.id.clone();
-                                let action = requirement_action;
-                                let pending = mutation_pending;
-                                view! {
-                                    <RequirementCard
-                                        requirement=requirement
-                                        pending=pending
-                                        on_action=Callback::new(move |next| action.run((requirement_id.clone(), next)))
-                                    />
-                                }
-                            }
-                        />
-                    </div>
+                    <RequirementGroup active_session=active_session kind=RequirementKind::Functional label="Functional requirements" pending=mutation_pending action=requirement_action />
+                    <RequirementGroup active_session=active_session kind=RequirementKind::NonFunctional label="Non-functional requirements" pending=mutation_pending action=requirement_action />
+                    <RequirementGroup active_session=active_session kind=RequirementKind::Unclassified label="Awaiting classification" pending=mutation_pending action=requirement_action />
                 </Show>
+
+                <section class="open-questions">
+                    <h3>"Open questions"</h3>
+                    {move || active_session.get().map(|session| session.questions.into_iter().map(|question| view! { <p>{question}</p> }).collect_view())}
+                </section>
 
                 <details class="deleted-requirements">
                     <summary>
@@ -552,7 +534,9 @@ fn PlanningPanel(
                                 let pending = mutation_pending;
                                 view! {
                                     <div class="deleted-item">
-                                        <span>{requirement.text}</span>
+                                        <span>{format!("{} · {:?}", requirement.text, requirement.kind)}
+                                            <ul>{requirement.acceptance_criteria.into_iter().map(|criterion| view! { <li>{criterion}</li> }).collect_view()}</ul>
+                                        </span>
                                         <button
                                             class="text-button"
                                             disabled=move || pending.get()
@@ -651,7 +635,10 @@ fn RequirementCard(
     view! {
         <article class="requirement-card">
             <span class="requirement-marker" class:pinned-marker=pinned></span>
-            <p>{requirement.text}</p>
+            <div class="requirement-content">
+                <p>{requirement.text}</p>
+                <ul class="acceptance-criteria">{requirement.acceptance_criteria.into_iter().map(|criterion| view! { <li>{criterion}</li> }).collect_view()}</ul>
+            </div>
             <div class="requirement-actions">
                 <button
                     class="text-button pin-button"
@@ -679,6 +666,7 @@ fn Composer(
     pending: RwSignal<bool>,
     expanded: bool,
     placeholder: &'static str,
+    #[prop(default = "Planning agent")] agent_label: &'static str,
 ) -> impl IntoView {
     let on_submit = move |event: SubmitEvent| {
         event.prevent_default();
@@ -697,7 +685,7 @@ fn Composer(
                 rows=if expanded { 3 } else { 2 }
                 prop:value=move || value.get()
                 placeholder=placeholder
-                aria-label="Message the planning agent"
+                aria-label=format!("Message the {agent_label}")
                 disabled=move || pending.get()
                 on:input=move |event| value.set(event_target_value(&event))
                 on:keydown=on_keydown
@@ -705,7 +693,7 @@ fn Composer(
             <div class="composer-toolbar">
                 <div class="composer-context">
                     <span class="agent-light"></span>
-                    <span>"Planning agent"</span>
+                    <span>{agent_label}</span>
                     <span class="composer-divider"></span>
                     <span class="composer-local">"Local project"</span>
                 </div>
@@ -731,6 +719,7 @@ fn ProjectLibrary(
     project_pending: RwSignal<bool>,
     api_base: String,
     error: RwSignal<Option<String>>,
+    open_project: Callback<Project>,
 ) -> impl IntoView {
     let refresh = move |_| {
         let api_base = api_base.clone();
@@ -749,31 +738,37 @@ fn ProjectLibrary(
 
     view! {
         <main class="project-library">
-            <div class="library-heading">
-                <div>
-                    <div class="section-kicker">"BUILT WITH SOFTWARE FACTORY"</div>
-                    <h1>"Your projects"</h1>
-                    <p>"Projects created by your implementation agents, all in one place."</p>
+            <div class="library-heading library-heading-projects">
+                <div class="library-title">
+                    <div class="section-kicker">"WORKSPACE / PROJECTS"</div>
+                    <h1>"Projects"</h1>
+                    <p>"Local workspaces, architecture and implementation progress."</p>
                 </div>
-                <button class="button button-secondary" on:click=refresh disabled=move || project_pending.get()>
-                    <span>"↻"</span>"Refresh"
-                </button>
+                <div class="library-tools">
+                    <span class="library-count">{move || {
+                        let count = projects.get().len();
+                        format!("{count} PROJECT{}", if count == 1 { "" } else { "S" })
+                    }}</span>
+                    <button class="button button-secondary" on:click=refresh disabled=move || project_pending.get()>
+                        <span aria-hidden="true">"↻"</span>"Refresh"
+                    </button>
+                </div>
             </div>
             <Show
                 when=move || !projects.get().is_empty()
                 fallback=move || view! {
                     <div class="library-empty">
-                        <div class="empty-orb">"⌘"</div>
-                        <h2>"Your first project starts with a plan."</h2>
-                        <p>"Chat with the planning agent, agree on the architecture and requirements, then create a project."</p>
+                        <div class="empty-orb" aria-hidden="true">"P"</div>
+                        <h2>"No projects yet"</h2>
+                        <p>"Create a project from an agreed plan to start a workspace with its own orchestrator and task board."</p>
                     </div>
                 }
             >
                 <div class="project-grid">
                     <For
                         each=move || projects.get()
-                        key=|project| project.id.clone()
-                        children=move |project| view! { <ProjectCard project=project /> }
+                        key=|project| format!("{}:{}:{:?}", project.id, project.status, project.error)
+                        children=move |project| view! { <ProjectCard project=project open_project=open_project /> }
                     />
                 </div>
             </Show>
@@ -782,28 +777,388 @@ fn ProjectLibrary(
 }
 
 #[component]
-fn ProjectCard(project: Project) -> impl IntoView {
+fn ProjectCard(project: Project, open_project: Callback<Project>) -> impl IntoView {
+    let selected = StoredValue::new(project.clone());
     let is_running = project.status == "running";
+    let is_queued = project.status == "queued";
     let is_failed = project.status == "failed";
     let is_completed = project.status == "completed";
-    let status_label = project.status.clone();
+    let status_label = project_status_label(&project.status).to_owned();
+    let status_detail = match project.status.as_str() {
+        "queued" => "Waiting for an implementation worker",
+        "running" => "Initial implementation is in progress",
+        "failed" => "Review the error before continuing",
+        _ => "Workspace ready for new changes",
+    };
+    let monogram = project
+        .name
+        .chars()
+        .next()
+        .unwrap_or('P')
+        .to_uppercase()
+        .to_string();
+    let requirement_count = project.snapshot.requirements.len();
+    let stack_count = project.snapshot.architecture.stack.len();
     let project_error = project.error;
     view! {
         <article class="project-card">
             <div class="project-card-top">
-                <span class="project-card-icon">"⌘"</span>
-                <span class="project-status" class:status-running=is_running class:status-failed=is_failed class:status-completed=is_completed>
+                <span class="project-card-icon" aria-hidden="true">{monogram}</span>
+                <span class="project-status" class:status-running=is_running class:status-queued=is_queued class:status-failed=is_failed class:status-completed=is_completed>
                     <i></i>{status_label}
                 </span>
             </div>
             <h2>{project.name}</h2>
-            <p class="project-path">{project.path}</p>
+            <p class="project-card-summary">{status_detail}</p>
+            <div class="project-path-block"><span>"PROJECT DIRECTORY"</span><code class="project-path">{project.path}</code></div>
             <div class="project-card-meta">
-                <span>{format!("{} requirement(s)", project.snapshot.requirements.len())}</span>
-                <span>{project.snapshot.architecture.stack.len()} " stack choices"</span>
+                <span><strong>{requirement_count}</strong> " requirements"</span>
+                <span><strong>{stack_count}</strong> " technologies"</span>
             </div>
             {project_error.map(|message| view! { <p class="project-error">{message}</p> })}
+            <button class="button button-secondary project-open-button" disabled=!is_completed on:click=move |_| open_project.run(selected.get_value())>
+                "Open workspace"<span aria-hidden="true">"→"</span>
+            </button>
         </article>
+    }
+}
+
+fn project_status_label(status: &str) -> &'static str {
+    match status {
+        "queued" => "Queued",
+        "running" => "Building",
+        "failed" => "Needs attention",
+        _ => "Ready",
+    }
+}
+
+fn requirement_kind_label(kind: &RequirementKind) -> &'static str {
+    match kind {
+        RequirementKind::Functional => "FUNCTIONAL",
+        RequirementKind::NonFunctional => "NON-FUNCTIONAL",
+        RequirementKind::Unclassified => "UNCLASSIFIED",
+    }
+}
+
+#[component]
+fn RequirementGroup(
+    active_session: RwSignal<Option<SessionState>>,
+    kind: RequirementKind,
+    label: &'static str,
+    pending: RwSignal<bool>,
+    action: Callback<(String, RequirementAction)>,
+) -> impl IntoView {
+    let kind = StoredValue::new(kind);
+    view! {
+        <div class="requirement-group">
+            <h4>{label}</h4>
+            <div class="requirement-list">
+                <For each=move || active_session.get().map(|s| s.requirements.into_iter().filter(|r| r.kind == kind.get_value()).collect::<Vec<_>>()).unwrap_or_default()
+                    key=requirement_view_key children=move |requirement| {
+                        let id = requirement.id.clone();
+                        view! { <RequirementCard requirement=requirement pending=pending on_action=Callback::new(move |next| action.run((id.clone(), next))) /> }
+                    } />
+            </div>
+        </div>
+    }
+}
+
+#[component]
+fn ProjectWorkspaceView(
+    project: Project,
+    api_base: String,
+    go_back: Callback<()>,
+) -> impl IntoView {
+    let workspace = RwSignal::new(None::<ProjectWorkspace>);
+    let composer = RwSignal::new(String::new());
+    let pending = RwSignal::new(false);
+    let error = RwSignal::new(None::<String>);
+    let project = StoredValue::new(project);
+    let base = StoredValue::new(api_base);
+    let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let cleanup_alive = alive.clone();
+    on_cleanup(move || cleanup_alive.store(false, std::sync::atomic::Ordering::Relaxed));
+
+    let send = Callback::new({
+        let alive = alive.clone();
+        move |content: String| {
+            if pending.get_untracked() || content.trim().is_empty() {
+                return;
+            }
+            pending.set(true);
+            error.set(None);
+            workspace.update(|state| {
+                if let Some(state) = state {
+                    state.messages.push(Message {
+                        id: format!("pending-{}", state.revision),
+                        role: MessageRole::User,
+                        content: content.clone(),
+                        created_at: 0,
+                    });
+                }
+            });
+            let api_base = base.get_value();
+            let id = project.get_value().id;
+            let alive = alive.clone();
+            spawn_browser_task(async move {
+                let result: Result<ProjectWorkspace, UiError> = post_json(
+                    format!("{api_base}/api/projects/{id}/messages"),
+                    &SendMessageRequest { content },
+                )
+                .await;
+                if !alive.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                match result {
+                    Ok(state) => workspace.set(Some(state)),
+                    Err(failure) => {
+                        error.set(Some(failure.to_string()));
+                        if let Ok(state) = get_json::<ProjectWorkspace>(format!(
+                            "{api_base}/api/projects/{id}/workspace"
+                        ))
+                        .await
+                            && alive.load(std::sync::atomic::Ordering::Relaxed)
+                        {
+                            workspace.set(Some(state));
+                        }
+                    }
+                }
+                if alive.load(std::sync::atomic::Ordering::Relaxed) {
+                    pending.set(false);
+                }
+            });
+        }
+    });
+    let poll_alive = alive.clone();
+    let api_base = base.get_value();
+    let project_id = project.get_value().id;
+    spawn_browser_task(async move {
+        loop {
+            if !poll_alive.load(std::sync::atomic::Ordering::Relaxed) {
+                break;
+            }
+            if !pending.get_untracked() {
+                let result = get_json::<ProjectWorkspace>(format!(
+                    "{api_base}/api/projects/{project_id}/workspace"
+                ))
+                .await;
+                if !poll_alive.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                if !pending.get_untracked() {
+                    match result {
+                        Ok(state) => workspace.set(Some(state)),
+                        Err(failure) => error.set(Some(failure.to_string())),
+                    }
+                }
+            }
+            gloo_timers::future::TimeoutFuture::new(1_000).await;
+        }
+    });
+
+    view! {
+        <main class="project-workspace">
+            <div class="project-breadcrumbs">
+                <button class="text-button" on:click=move |_| go_back.run(())><span aria-hidden="true">"←"</span>"All projects"</button>
+                <span aria-hidden="true">"/"</span><span>{project.get_value().name}</span>
+            </div>
+            <header class="project-heading">
+                <div class="project-heading-main">
+                    <div class="section-kicker">"PROJECT WORKSPACE"</div>
+                    <h1>{project.get_value().name}</h1>
+                    <p>{project.get_value().snapshot.architecture.overview.clone()}</p>
+                </div>
+                <div class="project-heading-status">
+                    <span class="project-status status-completed"><i></i>"Ready"</span>
+                    <span class="repository-indicator"><span aria-hidden="true">"⌘"</span>" Local repository · main"</span>
+                </div>
+            </header>
+            <div class="project-context-row">
+                <span class="context-label">"DIRECTORY"</span><code>{project.get_value().path}</code>
+                <span class="context-separator"></span>
+                <span>{project.get_value().snapshot.requirements.len()} " agreed requirements"</span>
+                <details class="project-architecture">
+                    <summary>"Architecture & requirements"</summary>
+                    <div class="project-architecture-content">
+                        <ArchitectureView architecture=project.get_value().snapshot.architecture />
+                        <h3>"Agreed requirements"</h3>
+                        {project.get_value().snapshot.requirements.into_iter().map(|r| view! {
+                            <article class="project-requirement">
+                                <span class="requirement-type">{requirement_kind_label(&r.kind)}</span>
+                                <p>{r.text}</p>
+                                <ul>{r.acceptance_criteria.into_iter().map(|c| view! { <li>{c}</li> }).collect_view()}</ul>
+                            </article>
+                        }).collect_view()}
+                    </div>
+                </details>
+            </div>
+            {move || error.get().map(|message| view! { <div class="error-banner" role="alert">{message}</div> })}
+            <div class="project-collaboration">
+                <section class="orchestrator-chat">
+                    <div class="section-heading">
+                        <div><div class="section-kicker">"DISCUSS & DEFINE"</div><h2>"Project orchestrator"</h2></div>
+                        <span class="orchestrator-presence"><i></i>"Project agent"</span>
+                    </div>
+                    <div class="project-messages" aria-live="polite">
+                        <Show when=move || workspace.with(|w| w.as_ref().is_some_and(|w| !w.messages.is_empty())) fallback=move || view! {
+                            <div class="chat-empty-state"><span class="chat-empty-mark">"↗"</span><strong>"Start with the change you want to make"</strong><p>"The orchestrator will clarify scope, then prepare a plan for your review."</p></div>
+                        }>
+                        {move || workspace.get().map(|w| w.messages.into_iter().map(|m| view! {
+                            <article class="project-message" class:user-message=m.role == MessageRole::User>
+                                <div class="message-author"><span class="message-avatar">{if m.role == MessageRole::User { "Y" } else { "O" }}</span><strong>{if m.role == MessageRole::User { "You" } else { "Orchestrator" }}</strong></div>
+                                <p>{display_project_message(&m)}</p>
+                            </article>
+                        }).collect_view())}
+                        </Show>
+                        <Show when=move || pending.get()><p>"Orchestrator is responding…"</p></Show>
+                    </div>
+                    <Composer value=composer on_send=send pending=pending expanded=false placeholder="Describe a change or new feature…" agent_label="Project orchestrator" />
+                </section>
+                <section class="project-plans">
+                    <div class="section-heading">
+                        <div><div class="section-kicker">"NEXT STEP"</div><h2>"Implementation plan"</h2></div>
+                        {move || workspace.with(|w| view! { <span class="plan-count">{w.as_ref().map(|w| w.plans.len()).unwrap_or_default()}</span> })}
+                    </div>
+                    <p class="panel-description">"Review the proposed scope and approve it to queue work for implementation."</p>
+                    <div class="project-plan-list">
+                        {move || workspace.get().map(|w| {
+                            let tasks = w.tasks;
+                            w.plans.into_iter().rev().map(|plan| {
+                                let count = tasks.iter().filter(|task| task.plan_id == plan.id).count();
+                                view! { <PlanCard plan=plan task_count=count send=send pending=pending /> }
+                            }).collect_view()
+                        })}
+                        <Show when=move || workspace.with(|w| w.as_ref().is_some_and(|w| w.plans.is_empty()))>
+                            <div class="plan-empty-state"><span>"Plans appear here after you discuss a change."</span></div>
+                        </Show>
+                    </div>
+                </section>
+            </div>
+            <section class="task-board" aria-label="Read-only task kanban">
+                <div class="task-board-heading">
+                    <div><div class="section-kicker">"DELIVERY"</div><h2>"Task board"</h2><p>"Execution progress updates automatically. Task scope and status are managed by agents."</p></div>
+                    <div class="board-heading-meta">
+                        {move || workspace.with(|w| {
+                            let count = w.as_ref().map(|w| w.tasks.len()).unwrap_or_default();
+                            view! { <span class="board-count">{format!("{count} task{}", if count == 1 { "" } else { "s" })}</span> }
+                        })}
+                        <span class="board-scroll-hint"><span class="board-scroll-desktop">"Scroll to view all stages"</span><span class="board-scroll-mobile">"Swipe to view all stages"</span><span aria-hidden="true">"→"</span></span>
+                    </div>
+                </div>
+                <Show when=move || workspace.with(|w| w.as_ref().is_some_and(|w| !w.tasks.is_empty())) fallback=move || view! {
+                    <div class="board-empty-state"><span class="board-empty-icon">"01"</span><div><strong>"No tasks to track yet"</strong><p>"Discuss a change with the orchestrator. Approved work will appear in the board."</p></div></div>
+                }>
+                    <div class="kanban-viewport" tabindex="0" aria-label="Scroll horizontally to view all task statuses">
+                        <div class="kanban-grid">
+                            {[TaskStatus::PendingApproval, TaskStatus::Queued, TaskStatus::Implementing, TaskStatus::Verifying, TaskStatus::Integrating, TaskStatus::Completed, TaskStatus::Blocked, TaskStatus::Failed].into_iter().map(|status| {
+                                let label = task_status_label(&status);
+                                let status_class = task_status_class(&status).to_owned();
+                                let indicator_class = format!("lane-indicator {status_class}");
+                                let status_value = StoredValue::new(status);
+                                view! { <section class="kanban-column">
+                                    <header class="kanban-column-heading"><span class=indicator_class></span><h3>{label}</h3>
+                                        <span class="lane-count">{move || workspace.with(|w| w.as_ref().map(|w| w.tasks.iter().filter(|t| t.status == status_value.get_value()).count()).unwrap_or(0))}</span>
+                                    </header>
+                                    <div class="kanban-cards">
+                                        <For each=move || workspace.get().map(|w| w.tasks.into_iter().filter(|t| t.status == status_value.get_value()).collect::<Vec<_>>()).unwrap_or_default()
+                                            key=|task| task.id.clone()
+                                            children=move |task| view! { <TaskCard task=task /> } />
+                                        <Show when=move || workspace.with(|w| w.as_ref().is_some_and(|w| !w.tasks.iter().any(|t| t.status == status_value.get_value())))>
+                                            <p class="kanban-empty">"No tasks"</p>
+                                        </Show>
+                                    </div>
+                                </section> }
+                            }).collect_view()}
+                        </div>
+                    </div>
+                </Show>
+            </section>
+        </main>
+    }
+}
+
+#[component]
+fn PlanCard(
+    plan: software_factory_api_types::ProjectPlan,
+    task_count: usize,
+    send: Callback<String>,
+    pending: RwSignal<bool>,
+) -> impl IntoView {
+    let command = StoredValue::new(format!("confirm {}", plan.id));
+    let approval_available = !plan.approved && !plan.superseded;
+    let status = if plan.superseded {
+        "Replaced"
+    } else if plan.approved {
+        "Approved"
+    } else {
+        "Needs review"
+    };
+    view! {
+        <article class="project-plan" class:plan-superseded=plan.superseded>
+            <div class="plan-status-line"><span class="plan-state-marker" class:plan-state-approved=plan.approved class:plan-state-replaced=plan.superseded></span><span>{status}</span></div>
+            <h3>{plan.summary}</h3>
+            <div class="plan-metadata"><span>{task_count} " tasks"</span><span>"Acceptance criteria included"</span></div>
+            <Show when=move || approval_available>
+                <div class="approval-note"><strong>"Approval starts implementation"</strong><span>"Agents will create branches and update the task board as they work."</span></div>
+                <button class="button button-primary plan-approve-button" disabled=move || pending.get() on:click=move |_| send.run(command.get_value())>
+                    {move || if pending.get() { "Sending approval…" } else { "Approve plan and queue tasks" }}
+                </button>
+            </Show>
+        </article>
+    }
+}
+
+fn task_status_label(status: &TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::PendingApproval => "Awaiting approval",
+        TaskStatus::Queued => "Queued",
+        TaskStatus::Implementing => "Implementing",
+        TaskStatus::Verifying => "Verifying",
+        TaskStatus::Integrating => "Integrating",
+        TaskStatus::Completed => "Completed",
+        TaskStatus::Blocked => "Blocked",
+        TaskStatus::Failed => "Failed",
+    }
+}
+
+fn task_status_class(status: &TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::PendingApproval => "lane-pending",
+        TaskStatus::Queued => "lane-queued",
+        TaskStatus::Implementing => "lane-active",
+        TaskStatus::Verifying => "lane-verifying",
+        TaskStatus::Integrating => "lane-integrating",
+        TaskStatus::Completed => "lane-completed",
+        TaskStatus::Blocked => "lane-blocked",
+        TaskStatus::Failed => "lane-failed",
+    }
+}
+
+#[component]
+fn TaskCard(task: ProjectTask) -> impl IntoView {
+    let criteria_count = task.spec.acceptance_criteria.len();
+    let activity_count = task.activity.len();
+    view! {
+        <details class="task-card">
+            <summary><span class="task-card-title">{task.spec.title}</span><span class="task-expand-label">"Details"</span></summary>
+            <p class="task-card-description">{task.spec.description}</p>
+            <div class="task-card-meta"><span>{criteria_count} " acceptance checks"</span><span>{activity_count} " updates"</span></div>
+            <div class="task-card-details">
+                <div class="task-detail-group"><h4>"Acceptance criteria"</h4><ul>{task.spec.acceptance_criteria.into_iter().map(|c| view! { <li>{c}</li> }).collect_view()}</ul></div>
+                <div class="task-detail-group"><h4>"Verification"</h4>{task.spec.verification_commands.into_iter().map(|c| view! { <code>{c}</code> }).collect_view()}</div>
+                {(!task.spec.dependencies.is_empty()).then(|| view! { <div class="task-detail-group"><h4>"Dependencies"</h4><p>{format!("Depends on {} earlier task(s) in this plan", task.spec.dependencies.len())}</p></div> })}
+                {task.error.map(|value| view! { <div class="task-error"><strong>"Needs attention"</strong><p>{value}</p></div> })}
+                <details class="task-activity"><summary>{format!("Execution details · {} updates", activity_count)}</summary>
+                    <ul>{task.activity.into_iter().map(|a| view! { <li>{a}</li> }).collect_view()}</ul>
+                    <dl class="task-git-details">
+                        {task.branch.map(|value| view! { <div><dt>"Branch"</dt><dd><code>{value}</code></dd></div> })}
+                        {task.base_commit.map(|value| view! { <div><dt>"Started from"</dt><dd><code>{value}</code></dd></div> })}
+                        {task.commit.map(|value| view! { <div><dt>"Commit"</dt><dd><code>{value}</code></dd></div> })}
+                        {task.worktree.map(|value| view! { <div><dt>"Worktree"</dt><dd><code>{value}</code></dd></div> })}
+                    </dl>
+                </details>
+            </div>
+        </details>
     }
 }
 

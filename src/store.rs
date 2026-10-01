@@ -56,6 +56,59 @@ pub struct Store {
 }
 
 impl Store {
+    pub fn workspace(
+        &self,
+        project_id: &str,
+    ) -> Result<software_factory_api_types::ProjectWorkspace, StoreError> {
+        self.get_project(project_id)?;
+        let json: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT state_json FROM project_workspaces WHERE project_id = ?1",
+                [project_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match json {
+            Some(json) => Ok(serde_json::from_str(&json)?),
+            None => Ok(software_factory_api_types::ProjectWorkspace {
+                project_id: project_id.into(),
+                revision: 0,
+                messages: vec![],
+                plans: vec![],
+                tasks: vec![],
+            }),
+        }
+    }
+
+    pub fn save_workspace(
+        &mut self,
+        workspace: &mut software_factory_api_types::ProjectWorkspace,
+        expected_revision: i64,
+    ) -> Result<(), StoreError> {
+        let tx = self.connection.transaction()?;
+        let current: Option<String> = tx
+            .query_row(
+                "SELECT state_json FROM project_workspaces WHERE project_id = ?1",
+                [&workspace.project_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let revision = current
+            .map(|json| serde_json::from_str::<software_factory_api_types::ProjectWorkspace>(&json))
+            .transpose()?
+            .map_or(0, |state| state.revision);
+        if revision != expected_revision {
+            return Err(StoreError::Conflict(
+                "project changed while the agent was responding; reload and retry".into(),
+            ));
+        }
+        workspace.revision = revision + 1;
+        tx.execute("INSERT INTO project_workspaces (project_id, state_json) VALUES (?1, ?2) ON CONFLICT(project_id) DO UPDATE SET state_json = excluded.state_json", params![workspace.project_id, serde_json::to_string(workspace)?])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn open(path: &Path) -> Result<Self, StoreError> {
         let connection = Connection::open(path)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
@@ -80,7 +133,7 @@ impl Store {
         let schema_version = self
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-        if schema_version > 1 {
+        if schema_version > 2 {
             return Err(StoreError::Invalid(format!(
                 "database schema version {schema_version} is newer than this executable supports"
             )));
@@ -136,8 +189,22 @@ impl Store {
             );
             CREATE INDEX IF NOT EXISTS projects_session
                 ON projects(session_id, created_at);
-            PRAGMA user_version = 1;",
+             ",
         )?;
+        if schema_version < 2 {
+            self.connection.execute_batch(
+                "BEGIN;
+                 ALTER TABLE sessions ADD COLUMN questions_json TEXT NOT NULL DEFAULT '[]';
+                 ALTER TABLE requirements ADD COLUMN details_json TEXT NOT NULL DEFAULT '{}';
+                 ALTER TABLE deleted_requirements ADD COLUMN details_json TEXT NOT NULL DEFAULT '{}';
+                 CREATE TABLE project_workspaces (
+                     project_id TEXT PRIMARY KEY REFERENCES projects(id),
+                     state_json TEXT NOT NULL
+                 );
+                 PRAGMA user_version = 2;
+                 COMMIT;",
+            )?;
+        }
         Ok(())
     }
 
@@ -214,14 +281,24 @@ impl Store {
         let timestamp = now();
         for change in &response.requirement_changes {
             match change {
-                RequirementChange::Add { text } => {
+                RequirementChange::Add {
+                    text,
+                    kind,
+                    acceptance_criteria,
+                } => {
                     tx.execute(
                         "INSERT INTO requirements (id, session_id, text, pinned, created_at, updated_at)
                          VALUES (?1, ?2, ?3, 0, ?4, ?4)",
                         params![new_id(), session_id, text.trim(), timestamp],
                     )?;
+                    tx.execute("UPDATE requirements SET details_json = ?1 WHERE session_id = ?2 AND text = ?3", params![serde_json::to_string(&RequirementDetails { kind: kind.clone(), acceptance_criteria: acceptance_criteria.clone() })?, session_id, text.trim()])?;
                 }
-                RequirementChange::Update { id, text } => {
+                RequirementChange::Update {
+                    id,
+                    text,
+                    kind,
+                    acceptance_criteria,
+                } => {
                     let changed = tx.execute(
                         "UPDATE requirements SET text = ?1, updated_at = ?2
                          WHERE id = ?3 AND session_id = ?4 AND pinned = 0",
@@ -232,9 +309,23 @@ impl Store {
                             "requirement `{id}` changed while the planning agent was responding"
                         )));
                     }
+                    tx.execute(
+                        "UPDATE requirements SET details_json = ?1 WHERE id = ?2",
+                        params![
+                            serde_json::to_string(&RequirementDetails {
+                                kind: kind.clone(),
+                                acceptance_criteria: acceptance_criteria.clone()
+                            })?,
+                            id
+                        ],
+                    )?;
                 }
             }
         }
+        tx.execute(
+            "UPDATE sessions SET questions_json = ?1 WHERE id = ?2",
+            params![serde_json::to_string(&response.questions)?, session_id],
+        )?;
 
         let content = if response.questions.is_empty() {
             response.message.clone()
@@ -289,11 +380,11 @@ impl Store {
         requirement_id: &str,
     ) -> Result<SessionState, StoreError> {
         let tx = self.connection.transaction()?;
-        let text = tx
+        let (text, details) = tx
             .query_row(
-                "SELECT text FROM requirements WHERE id = ?1 AND session_id = ?2",
+                "SELECT text, details_json FROM requirements WHERE id = ?1 AND session_id = ?2",
                 params![requirement_id, session_id],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?
             .ok_or_else(|| {
@@ -305,9 +396,9 @@ impl Store {
             params![requirement_id, session_id],
         )?;
         tx.execute(
-            "INSERT INTO deleted_requirements (id, session_id, text, deleted_at, restored_at)
-             VALUES (?1, ?2, ?3, ?4, NULL)",
-            params![requirement_id, session_id, text, timestamp],
+            "INSERT INTO deleted_requirements (id, session_id, text, deleted_at, restored_at, details_json)
+              VALUES (?1, ?2, ?3, ?4, NULL, ?5)",
+            params![requirement_id, session_id, text, timestamp, details],
         )?;
         bump_revision(&tx, session_id, timestamp)?;
         tx.commit()?;
@@ -320,12 +411,12 @@ impl Store {
         requirement_id: &str,
     ) -> Result<SessionState, StoreError> {
         let tx = self.connection.transaction()?;
-        let text = tx
+        let (text, details) = tx
             .query_row(
-                "SELECT text FROM deleted_requirements
+                "SELECT text, details_json FROM deleted_requirements
                  WHERE id = ?1 AND session_id = ?2 AND restored_at IS NULL",
                 params![requirement_id, session_id],
-                |row| row.get::<_, String>(0),
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
             .optional()?
             .ok_or_else(|| {
@@ -363,6 +454,10 @@ impl Store {
                  ORDER BY deleted_at DESC LIMIT 1
              )",
             params![timestamp, requirement_id, session_id],
+        )?;
+        tx.execute(
+            "UPDATE requirements SET details_json = ?1 WHERE id = ?2",
+            params![details, requirement_id],
         )?;
         bump_revision(&tx, session_id, timestamp)?;
         tx.commit()?;
@@ -474,7 +569,7 @@ impl Store {
 fn load_session(connection: &Connection, id: &str) -> Result<SessionState, StoreError> {
     let row = connection
         .query_row(
-            "SELECT id, revision, architecture_json, created_at, updated_at
+            "SELECT id, revision, architecture_json, created_at, updated_at, questions_json
              FROM sessions WHERE id = ?1",
             [id],
             |row| {
@@ -484,6 +579,7 @@ fn load_session(connection: &Connection, id: &str) -> Result<SessionState, Store
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
                 ))
             },
         )
@@ -512,29 +608,35 @@ fn load_session(connection: &Connection, id: &str) -> Result<SessionState, Store
     };
     let requirements = {
         let mut statement = connection.prepare(
-            "SELECT id, text, pinned FROM requirements WHERE session_id = ?1 ORDER BY created_at, id",
+            "SELECT id, text, pinned, details_json FROM requirements WHERE session_id = ?1 ORDER BY created_at, id",
         )?;
         statement
             .query_map([id], |row| {
+                let details = requirement_details(row, 3)?;
                 Ok(Requirement {
                     id: row.get(0)?,
                     text: row.get(1)?,
                     pinned: row.get(2)?,
+                    kind: details.kind,
+                    acceptance_criteria: details.acceptance_criteria,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?
     };
     let deleted_requirements = {
         let mut statement = connection.prepare(
-            "SELECT id, text, deleted_at FROM deleted_requirements
+            "SELECT id, text, deleted_at, details_json FROM deleted_requirements
              WHERE session_id = ?1 AND restored_at IS NULL ORDER BY deleted_at, id",
         )?;
         statement
             .query_map([id], |row| {
+                let details = requirement_details(row, 3)?;
                 Ok(DeletedRequirement {
                     id: row.get(0)?,
                     text: row.get(1)?,
                     deleted_at: row.get(2)?,
+                    kind: details.kind,
+                    acceptance_criteria: details.acceptance_criteria,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?
@@ -548,6 +650,28 @@ fn load_session(connection: &Connection, id: &str) -> Result<SessionState, Store
         deleted_requirements,
         created_at: row.3,
         updated_at: row.4,
+        questions: serde_json::from_str(&row.5)?,
+    })
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+#[serde(default)]
+struct RequirementDetails {
+    kind: crate::domain::RequirementKind,
+    acceptance_criteria: Vec<String>,
+}
+
+fn requirement_details(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+) -> rusqlite::Result<RequirementDetails> {
+    let json: String = row.get(index)?;
+    serde_json::from_str(&json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(error),
+        )
     })
 }
 
@@ -613,11 +737,78 @@ mod tests {
     use crate::domain::{Architecture, PlannerResponse, RequirementChange};
 
     #[test]
+    fn migrates_legacy_data_without_inventing_requirement_categories() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("legacy.sqlite3");
+        let (session_id, requirement_id) = {
+            let mut store = Store::open(&path).unwrap();
+            let session = store.create_session().unwrap();
+            store.connection.execute("INSERT INTO requirements (id, session_id, text, pinned, created_at, updated_at) VALUES ('legacy', ?1, 'Existing requirement', 1, 1, 1)", [&session.id]).unwrap();
+            store.connection.execute("INSERT INTO deleted_requirements (id, session_id, text, deleted_at) VALUES ('deleted', ?1, 'Deleted requirement', 1)", [&session.id]).unwrap();
+            store.connection.execute_batch("ALTER TABLE sessions DROP COLUMN questions_json; ALTER TABLE requirements DROP COLUMN details_json; ALTER TABLE deleted_requirements DROP COLUMN details_json; DROP TABLE project_workspaces; PRAGMA user_version = 1;").unwrap();
+            (session.id, "legacy")
+        };
+        let store = Store::open(&path).unwrap();
+        let session = store.get_session(&session_id).unwrap();
+        assert_eq!(session.requirements[0].id, requirement_id);
+        assert!(session.requirements[0].pinned);
+        assert_eq!(
+            session.requirements[0].kind,
+            crate::domain::RequirementKind::Unclassified
+        );
+        assert!(session.requirements[0].acceptance_criteria.is_empty());
+        assert_eq!(session.deleted_requirements[0].id, "deleted");
+        assert!(session.questions.is_empty());
+    }
+
+    #[test]
+    fn typed_requirements_and_questions_survive_delete_restore_and_snapshot() {
+        let mut store = Store::in_memory();
+        let session = store.create_session().unwrap();
+        let response = PlannerResponse {
+            schema_version: 2,
+            message: "Quality requirement".into(),
+            architecture: Some(Architecture {
+                overview: "Local service".into(),
+                stack: vec![],
+                decisions: vec![],
+            }),
+            requirement_changes: vec![RequirementChange::Add {
+                text: "Respond promptly".into(),
+                kind: crate::domain::RequirementKind::NonFunctional,
+                acceptance_criteria: vec!["p95 latency below 100ms at agreed load".into()],
+            }],
+            questions: vec!["What is the target load?".into()],
+        };
+        let session = store
+            .apply_planner_response(&session.id, session.revision, &response)
+            .unwrap();
+        let requirement = session.requirements[0].clone();
+        let project = store
+            .create_project_record(&session.id, "sample", "/tmp/sample")
+            .unwrap();
+        assert_eq!(project.snapshot.requirements[0], requirement);
+        let deleted = store
+            .delete_requirement(&session.id, &requirement.id)
+            .unwrap();
+        assert_eq!(deleted.deleted_requirements[0].kind, requirement.kind);
+        assert_eq!(
+            deleted.deleted_requirements[0].acceptance_criteria,
+            requirement.acceptance_criteria
+        );
+        let restored = store
+            .restore_requirement(&session.id, &requirement.id)
+            .unwrap();
+        assert_eq!(restored.requirements[0], requirement);
+        assert_eq!(restored.questions, response.questions);
+    }
+
+    #[test]
     fn persists_sessions_and_deleted_requirement_tombstones() {
         let mut store = Store::in_memory();
         let session = store.create_session().expect("session should be created");
         let response = PlannerResponse {
-            schema_version: 1,
+            schema_version: 2,
             message: "A requirement was added".to_owned(),
             architecture: Some(Architecture {
                 overview: "A small service".to_owned(),
@@ -626,6 +817,8 @@ mod tests {
             }),
             requirement_changes: vec![RequirementChange::Add {
                 text: "Store data locally".to_owned(),
+                kind: crate::domain::RequirementKind::Functional,
+                acceptance_criteria: vec!["Data survives restart".into()],
             }],
             questions: vec![],
         };
@@ -659,7 +852,7 @@ mod tests {
             .expect("another message should be stored");
 
         let response = PlannerResponse {
-            schema_version: 1,
+            schema_version: 2,
             message: "Response".to_owned(),
             architecture: None,
             requirement_changes: vec![],
@@ -676,7 +869,7 @@ mod tests {
         let mut store = Store::in_memory();
         let session = store.create_session().expect("session should be created");
         let response = PlannerResponse {
-            schema_version: 1,
+            schema_version: 2,
             message: "A requirement was added".to_owned(),
             architecture: Some(Architecture {
                 overview: "A service".to_owned(),
@@ -685,6 +878,8 @@ mod tests {
             }),
             requirement_changes: vec![RequirementChange::Add {
                 text: "Persist projects".to_owned(),
+                kind: crate::domain::RequirementKind::Functional,
+                acceptance_criteria: vec!["Projects survive restart".into()],
             }],
             questions: vec![],
         };
@@ -708,7 +903,7 @@ mod tests {
         let mut store = Store::in_memory();
         let session = store.create_session().expect("session should be created");
         let response = PlannerResponse {
-            schema_version: 1,
+            schema_version: 2,
             message: "A requirement was added".to_owned(),
             architecture: Some(Architecture {
                 overview: "A service".to_owned(),
@@ -717,6 +912,8 @@ mod tests {
             }),
             requirement_changes: vec![RequirementChange::Add {
                 text: "Persist project data".to_owned(),
+                kind: crate::domain::RequirementKind::Functional,
+                acceptance_criteria: vec!["Data survives restart".into()],
             }],
             questions: vec![],
         };
@@ -728,11 +925,13 @@ mod tests {
             .delete_requirement(&session.id, &id)
             .expect("requirement should be deleted");
         let response = PlannerResponse {
-            schema_version: 1,
+            schema_version: 2,
             message: "I added that requirement again".to_owned(),
             architecture: None,
             requirement_changes: vec![RequirementChange::Add {
                 text: "  PERSIST project data ".to_owned(),
+                kind: crate::domain::RequirementKind::Functional,
+                acceptance_criteria: vec!["Data survives restart".into()],
             }],
             questions: vec![],
         };
@@ -750,12 +949,14 @@ mod tests {
         );
 
         let update = PlannerResponse {
-            schema_version: 1,
+            schema_version: 2,
             message: "I updated the deleted requirement".to_owned(),
             architecture: None,
             requirement_changes: vec![RequirementChange::Update {
                 id,
                 text: "Recreate the deleted requirement".to_owned(),
+                kind: crate::domain::RequirementKind::Functional,
+                acceptance_criteria: vec!["Data survives restart".into()],
             }],
             questions: vec![],
         };
@@ -771,7 +972,7 @@ mod tests {
         let mut store = Store::in_memory();
         let session = store.create_session().expect("session should be created");
         let response = PlannerResponse {
-            schema_version: 1,
+            schema_version: 2,
             message: "A requirement was added".to_owned(),
             architecture: Some(Architecture {
                 overview: "A service".to_owned(),
@@ -780,6 +981,8 @@ mod tests {
             }),
             requirement_changes: vec![RequirementChange::Add {
                 text: "Persist projects".to_owned(),
+                kind: crate::domain::RequirementKind::Functional,
+                acceptance_criteria: vec!["Projects survive restart".into()],
             }],
             questions: vec![],
         };
@@ -812,7 +1015,7 @@ mod tests {
                 .add_user_message(&session.id, "Build a small app")
                 .expect("user message should be stored");
             let response = PlannerResponse {
-                schema_version: 1,
+                schema_version: 2,
                 message: "A plan was agreed".to_owned(),
                 architecture: Some(Architecture {
                     overview: "A persisted architecture".to_owned(),
@@ -821,6 +1024,8 @@ mod tests {
                 }),
                 requirement_changes: vec![RequirementChange::Add {
                     text: "Persist its data".to_owned(),
+                    kind: crate::domain::RequirementKind::Functional,
+                    acceptance_criteria: vec!["Data survives restart".into()],
                 }],
                 questions: vec![],
             };
@@ -865,7 +1070,7 @@ mod tests {
         let mut store = Store::in_memory();
         let session = store.create_session().expect("session should be created");
         let initial = PlannerResponse {
-            schema_version: 1,
+            schema_version: 2,
             message: "Initial plan".to_owned(),
             architecture: Some(Architecture {
                 overview: "Original architecture".to_owned(),
@@ -874,6 +1079,8 @@ mod tests {
             }),
             requirement_changes: vec![RequirementChange::Add {
                 text: "Keep the data local".to_owned(),
+                kind: crate::domain::RequirementKind::NonFunctional,
+                acceptance_criteria: vec!["No remote data storage".into()],
             }],
             questions: vec![],
         };
@@ -888,7 +1095,7 @@ mod tests {
             .add_user_message(&session.id, "Continue planning")
             .expect("user message should be stored");
         let invalid = PlannerResponse {
-            schema_version: 1,
+            schema_version: 2,
             message: "A conflicting update".to_owned(),
             architecture: Some(Architecture {
                 overview: "Changed architecture".to_owned(),
@@ -898,6 +1105,8 @@ mod tests {
             requirement_changes: vec![RequirementChange::Update {
                 id: requirement_id.clone(),
                 text: "Change the pinned requirement".to_owned(),
+                kind: crate::domain::RequirementKind::Functional,
+                acceptance_criteria: vec!["Changed".into()],
             }],
             questions: vec![],
         };
@@ -925,7 +1134,7 @@ mod tests {
         let mut store = Store::in_memory();
         let session = store.create_session().expect("session should be created");
         let response = PlannerResponse {
-            schema_version: 1,
+            schema_version: 2,
             message: "A plan was agreed".to_owned(),
             architecture: Some(Architecture {
                 overview: "A small service".to_owned(),
@@ -934,6 +1143,8 @@ mod tests {
             }),
             requirement_changes: vec![RequirementChange::Add {
                 text: "Write a project file".to_owned(),
+                kind: crate::domain::RequirementKind::Functional,
+                acceptance_criteria: vec!["Project file exists".into()],
             }],
             questions: vec![],
         };
