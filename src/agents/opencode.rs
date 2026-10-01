@@ -168,6 +168,18 @@ impl BuilderAgent for OpenCodeAgent {
         let text = extract_text_events(&String::from_utf8_lossy(&output.stdout))?;
         serde_json::from_str(&text).map_err(|error| AgentError::InvalidOutput(error.to_string()))
     }
+
+    fn summarize_orchestration(
+        &self,
+        working_directory: &Path,
+        prompt: &str,
+    ) -> Result<crate::orchestration::ConversationMemory, AgentError> {
+        let output = self.invoke(working_directory, "plan", prompt)?;
+        Self::check_status(&output)?;
+        let text = extract_text_events(&String::from_utf8_lossy(&output.stdout))?;
+        serde_json::from_str(&text).map_err(|error| AgentError::InvalidOutput(error.to_string()))
+    }
+
     fn plan(&self, working_directory: &Path, prompt: &str) -> Result<PlannerResponse, AgentError> {
         let output = self.invoke(working_directory, "plan", prompt)?;
         Self::check_status(&output)?;

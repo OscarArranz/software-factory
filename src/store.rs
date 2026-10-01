@@ -81,6 +81,82 @@ impl Store {
         }
     }
 
+    pub fn conversation_memory(
+        &self,
+        project_id: &str,
+    ) -> Result<crate::orchestration::MemoryCheckpoint, StoreError> {
+        self.get_project(project_id)?;
+        let json: Option<String> = self
+            .connection
+            .query_row(
+                "SELECT state_json FROM project_conversation_memory WHERE project_id = ?1",
+                [project_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match json {
+            Some(json) => Ok(serde_json::from_str(&json)?),
+            None => Ok(crate::orchestration::MemoryCheckpoint::default()),
+        }
+    }
+
+    pub fn save_conversation_memory(
+        &mut self,
+        project_id: &str,
+        checkpoint: &mut crate::orchestration::MemoryCheckpoint,
+        expected_revision: i64,
+    ) -> Result<(), StoreError> {
+        checkpoint.memory.validate()?;
+        let tx = self.connection.transaction()?;
+        let current: Option<String> = tx
+            .query_row(
+                "SELECT state_json FROM project_conversation_memory WHERE project_id = ?1",
+                [project_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let revision = current
+            .as_deref()
+            .map(serde_json::from_str::<crate::orchestration::MemoryCheckpoint>)
+            .transpose()?
+            .map_or(0, |state| state.revision);
+        if revision != expected_revision {
+            return Err(StoreError::Conflict(
+                "conversation memory changed while it was being summarized; retry the message"
+                    .into(),
+            ));
+        }
+        if let Some(message_id) = checkpoint.through_message_id.as_deref() {
+            let workspace: Option<String> = tx
+                .query_row(
+                    "SELECT state_json FROM project_workspaces WHERE project_id = ?1",
+                    [project_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let exists = workspace
+                .map(|json| {
+                    serde_json::from_str::<software_factory_api_types::ProjectWorkspace>(&json)
+                        .map(|workspace| workspace.messages.iter().any(|m| m.id == message_id))
+                })
+                .transpose()?
+                .unwrap_or(false);
+            if !exists {
+                return Err(StoreError::Conflict(
+                    "conversation memory references a message that is no longer available".into(),
+                ));
+            }
+        }
+        checkpoint.revision = revision + 1;
+        tx.execute(
+            "INSERT INTO project_conversation_memory (project_id, state_json) VALUES (?1, ?2)
+             ON CONFLICT(project_id) DO UPDATE SET state_json = excluded.state_json",
+            params![project_id, serde_json::to_string(checkpoint)?],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn save_workspace(
         &mut self,
         workspace: &mut software_factory_api_types::ProjectWorkspace,
@@ -133,7 +209,7 @@ impl Store {
         let schema_version = self
             .connection
             .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))?;
-        if schema_version > 2 {
+        if schema_version > 3 {
             return Err(StoreError::Invalid(format!(
                 "database schema version {schema_version} is newer than this executable supports"
             )));
@@ -202,6 +278,17 @@ impl Store {
                      state_json TEXT NOT NULL
                  );
                  PRAGMA user_version = 2;
+                 COMMIT;",
+            )?;
+        }
+        if schema_version < 3 {
+            self.connection.execute_batch(
+                "BEGIN;
+                 CREATE TABLE IF NOT EXISTS project_conversation_memory (
+                     project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                     state_json TEXT NOT NULL
+                 );
+                 PRAGMA user_version = 3;
                  COMMIT;",
             )?;
         }

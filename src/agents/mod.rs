@@ -18,6 +18,16 @@ pub trait BuilderAgent: Send + Sync {
             "orchestration is not supported by this adapter".into(),
         ))
     }
+
+    fn summarize_orchestration(
+        &self,
+        _working_directory: &Path,
+        _prompt: &str,
+    ) -> Result<crate::orchestration::ConversationMemory, AgentError> {
+        Err(AgentError::InvalidOutput(
+            "orchestration memory is not supported by this adapter".into(),
+        ))
+    }
 }
 
 #[derive(Debug)]

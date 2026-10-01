@@ -515,6 +515,24 @@ async fn send_project_message(
         store.save_workspace(&mut workspace, revision)?;
         workspace
     };
+    let mut checkpoint = state.store()?.conversation_memory(&project_id)?;
+    let batch = crate::orchestration::compaction_batch(&workspace, &checkpoint)?;
+    if !batch.is_empty() {
+        let prompt = crate::orchestration::memory_prompt(&checkpoint.memory, &batch)?;
+        let agent = Arc::clone(&state.agent);
+        let project_directory = FsPath::new(&project.path).to_path_buf();
+        let summarized = tokio::task::spawn_blocking(move || {
+            agent.summarize_orchestration(&project_directory, &prompt)
+        })
+        .await
+        .map_err(ApiError::internal)?
+        .map_err(ApiError::agent)?;
+        let expected_revision = checkpoint.revision;
+        crate::orchestration::update_checkpoint(&mut checkpoint, &batch, summarized, &workspace)?;
+        state
+            .store()?
+            .save_conversation_memory(&project_id, &mut checkpoint, expected_revision)?;
+    }
     // Prepare Git before read-only orchestration, serialized with integration.
     let preparing_state = state.clone();
     let preparing_project = project.clone();
@@ -526,7 +544,7 @@ async fn send_project_message(
     .await
     .map_err(ApiError::internal)?
     .map_err(ApiError::conflict)?;
-    let prompt = crate::orchestration::prompt(&project, &workspace).map_err(ApiError::internal)?;
+    let prompt = crate::orchestration::prompt(&project, &workspace, &checkpoint)?;
     let agent = Arc::clone(&state.agent);
     let response =
         tokio::task::spawn_blocking(move || agent.orchestrate(FsPath::new(&project.path), &prompt))
@@ -639,6 +657,7 @@ mod tests {
     struct FakeAgent {
         response: Arc<Mutex<Option<PlannerResponse>>>,
         implementation_calls: Arc<Mutex<Vec<(PathBuf, String)>>>,
+        orchestration_prompts: Arc<Mutex<Vec<String>>>,
         create_project_files: bool,
     }
 
@@ -646,8 +665,12 @@ mod tests {
         fn orchestrate(
             &self,
             _: &Path,
-            _: &str,
+            prompt: &str,
         ) -> Result<crate::orchestration::OrchestratorResponse, AgentError> {
+            self.orchestration_prompts
+                .lock()
+                .expect("fake prompt lock should work")
+                .push(prompt.into());
             Ok(crate::orchestration::OrchestratorResponse {
                 schema_version: 1,
                 message: "Review this change plan".into(),
@@ -663,6 +686,29 @@ mod tests {
                 }),
             })
         }
+
+        fn summarize_orchestration(
+            &self,
+            _: &Path,
+            prompt: &str,
+        ) -> Result<crate::orchestration::ConversationMemory, AgentError> {
+            let (_, messages) = prompt
+                .rsplit_once("Transcript batch:\n")
+                .expect("summary prompt should contain its transcript batch");
+            let messages: Vec<software_factory_api_types::Message> =
+                serde_json::from_str(messages).expect("summary batch should be JSON");
+            let first = messages.first().expect("summary batch should not be empty");
+            Ok(crate::orchestration::ConversationMemory {
+                summary: "The user discussed the project's earlier direction.".into(),
+                decisions: vec![crate::orchestration::MemoryFact {
+                    content: "Keep the local-first workflow.".into(),
+                    source_message_ids: vec![first.id.clone()],
+                }],
+                open_questions: vec![],
+                ideas: vec![],
+            })
+        }
+
         fn plan(
             &self,
             _working_directory: &Path,
@@ -693,6 +739,7 @@ mod tests {
         FakeAgent {
             response: Arc::new(Mutex::new(Some(response))),
             implementation_calls: Arc::new(Mutex::new(Vec::new())),
+            orchestration_prompts: Arc::new(Mutex::new(Vec::new())),
             create_project_files: true,
         }
     }
@@ -803,6 +850,71 @@ mod tests {
         assert_eq!(forbidden.status(), StatusCode::METHOD_NOT_ALLOWED);
         let fetched = request(app, "GET", &read_url, None).await;
         assert_eq!(json_body(fetched).await["tasks"][0]["status"], "queued");
+    }
+
+    #[tokio::test]
+    async fn project_chat_compacts_old_discussion_and_reuses_its_context() {
+        let home = tempfile::tempdir().unwrap();
+        let agent = fake_agent(project_plan_response());
+        let captured_prompts = Arc::clone(&agent.orchestration_prompts);
+        let state = state_with_agent(agent, home.path());
+        let app = router(state.clone());
+        let session = create_planned_session(&app).await;
+        let directory = home.path().join("sf/projects/context");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("README.md"), "context test project").unwrap();
+        let project = {
+            let mut store = state.store().unwrap();
+            let project = store
+                .create_project_record(&session.id, "context", &directory.to_string_lossy())
+                .unwrap();
+            store
+                .update_project_status(&project.id, "completed", None)
+                .unwrap()
+        };
+        {
+            let mut store = state.store().unwrap();
+            let mut workspace = store.workspace(&project.id).unwrap();
+            for index in 0..22 {
+                workspace.messages.push(software_factory_api_types::Message {
+                    id: format!("old-{index}"),
+                    role: if index % 2 == 0 {
+                        crate::domain::MessageRole::User
+                    } else {
+                        crate::domain::MessageRole::Assistant
+                    },
+                    content: if index == 2 {
+                        "We discussed the import wizard and agreed its defaults should stay simple."
+                            .into()
+                    } else {
+                        format!("Archived discussion {index}")
+                    },
+                    created_at: index,
+                });
+            }
+            store.save_workspace(&mut workspace, 0).unwrap();
+        }
+
+        let response = request(
+            app,
+            "POST",
+            &format!("/api/projects/{}/messages", project.id),
+            Some(json!({"content":"Can we revisit the import wizard?"})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let checkpoint = state
+            .store()
+            .unwrap()
+            .conversation_memory(&project.id)
+            .unwrap();
+        assert_eq!(checkpoint.revision, 1);
+        assert_eq!(checkpoint.through_message_id.as_deref(), Some("old-2"));
+        assert_eq!(checkpoint.memory.decisions[0].source_message_ids, ["old-0"]);
+        let prompts = captured_prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert!(prompts[0].contains("old-2"));
+        assert!(prompts[0].contains("import wizard and agreed"));
     }
 
     #[tokio::test]
