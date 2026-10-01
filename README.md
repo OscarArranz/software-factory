@@ -13,8 +13,9 @@ through specifications before capabilities are implemented.
 - The multi-crate Cargo workspace includes a Leptos CSR web client at
   `crates/web-ui` and shared API types in `crates/api-types`.
 - The [`sf` terminal command](docs/specs/terminal-command.md),
-  [project builder API](docs/specs/project-builder-api.md), and
-  [web UI](docs/specs/builder-web-ui.md) are implemented. See
+  [project builder API](docs/specs/project-builder-api.md),
+  [web UI](docs/specs/builder-web-ui.md), and [local development
+  launcher](docs/specs/local-development-launcher.md) are implemented. See
   [`docs/specs/`](docs/specs/) for the workflow and template.
 
 ## Development
@@ -37,16 +38,19 @@ rustup target add wasm32-unknown-unknown
 cargo install --locked trunk
 ```
 
-Run `sf serve` in one terminal and the web client in another:
+From the repository root, start both the REST API and web client together:
 
 ```sh
-cd crates/web-ui
-trunk serve
+sf dev
 ```
 
-Open `http://127.0.0.1:8080`. The client uses
-`http://127.0.0.1:3000` for the API by default. Set `SF_API_BASE_URL` when
-building with Trunk to target another API origin.
+Open `http://127.0.0.1:8080`. The API is available at
+`http://127.0.0.1:3000`. Set `SF_API_BASE_URL` when building with Trunk to target
+another API origin. API bind settings and the UI port can be overridden with
+`sf dev --host <host> --port <port> --web-ui-port <port>`. Trunk and the
+`wasm32-unknown-unknown` Rust target must be installed. To run the services
+individually, start `sf serve` and run `trunk serve` from `crates/web-ui` in
+separate terminals.
 
 To create an optimized static bundle, run `trunk build --release` from
 `crates/web-ui`; the generated `dist/` directory is ignored by Git.
